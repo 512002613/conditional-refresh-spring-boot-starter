@@ -1,0 +1,165 @@
+# CLAUDE.md
+
+本文件为 Claude Code (claude.ai/code) 提供本仓库的代码工作指引。
+
+## 项目概述
+
+一个 Spring Boot Starter，通过 `@RefreshOnKeys` 注解提供**条件配置刷新**能力。被 `@RefreshOnKeys` 标记的 Bean 仅在其监听的特定配置 Key 发生变更时才会重建 —— 与全局性的 `@RefreshScope`（任意环境变化即刷新）不同。设计目标为与 Nacos Config（Spring Cloud Alibaba）协同工作。
+
+## 构建与测试命令
+
+```bash
+# 完整构建（编译 + 测试 + 打包）
+cd /d/devworkspace/conditional-refresh-spring-boot-starter && mvn clean package
+
+# 跳过测试
+mvn clean package -DskipTests
+
+# 仅运行测试
+mvn test
+
+# 运行单个测试类
+mvn test -Dtest=ConfigDiffUtilsTest
+
+# 运行单个测试方法
+mvn test -Dtest=MetadataCollectorTest#buildCommittedIndex_placeholderResolved
+
+# 仅编译（不运行测试）
+mvn clean compile
+
+# 安装到本地仓库（供下游项目使用）
+mvn clean install
+```
+
+**构建要求：** JDK 1.8+，Maven 3.6+。显式使用 `maven-surefire-plugin` 2.22.2 以兼容 JUnit 5。
+
+**测试框架：** JUnit 5 (Jupiter)，通过 `spring-boot-starter-test` 引入。Mockito 4.5.1 用于 mock。
+
+## 架构
+
+### 包结构
+
+```
+com.liu.conditionalrefresh
+├── annotation/       → @RefreshOnKeys（公共 API）
+├── config/           → 自动配置 + 属性绑定
+├── processor/        → Bean 定义扫描 + 元数据收集
+├── scope/            → 自定义作用域生命周期（GenericScope 扩展）
+├── listener/         → Nacos 回调 → diff → 去抖刷新
+└── exception/        → RefreshFailedException（@Deprecated，预留）
+```
+
+### 生命周期流程
+
+```
+@RefreshOnKeys 标记的 Bean
+    │
+    ▼（BeanDefinitionRegistryPostProcessor 阶段）
+RefreshOnKeysPostProcessor
+  ├─ 改写：scope="conditionalRefresh"，proxyMode=TARGET_CLASS（通过反射）
+  ├─ 校验：同一 Bean 不得同时标注 @RefreshScope
+  └─ 收集原始元数据 → MetadataCollector
+    │
+    ▼（Bean 实例化）
+Bean 以 scoped-proxy 形式创建（惰性 —— 仅在首次访问时实例化）
+    │
+    ▼（ApplicationReadyEvent）
+ConditionalRefreshListener.onApplicationEvent()
+  ├─ MetadataCollector.buildCommittedIndex(env)
+  │    ├─ 解析 keys/dataId/group 中的 ${...} 占位符
+  │    ├─ 回退规则：dataId → spring.application.name，group → DEFAULT_GROUP
+  │    └─ 构建反向索引：dataId → group → (key → Set<beanName>)
+  ├─ 按 (dataId, group) 获取初始配置快照（避免首次推送触发全量刷新）
+  └─ 按 (dataId, group) 注册 Nacos Listener
+    │
+    ▼（Nacos 推送 → receiveConfigInfo）
+ConditionalRefreshListener.handleChange()
+  ├─ ConfigDiffUtils.parse(newConfig) → 新快照 Map
+  ├─ 原子替换快照 + 获取旧快照
+  ├─ ConfigDiffUtils.diff(old, new) → 变更的 keys（忽略删除）
+  ├─ ListenerContext.findAffectedBeans(changedKeys) → 受影响的 bean 名称集合
+  │    └─ 委托给 MetadataCollector.IndexEntry.findAffectedBeans()
+  └─ 按 bean：Debouncer.debounce(beanName, refreshTask)
+       │（去抖窗口后，在线程池中执行）
+       ▼
+  ConditionalRefreshScope.refresh(beanName)
+    ├─ ReentrantLock.lock()（按 bean 粒度）
+    ├─ super.remove() → 触发 destroyMethod
+    └─ 新实例在下次代理访问时惰性创建
+       （成功指标 = "旧实例已销毁"，而非"新实例已创建"）
+```
+
+### 核心组件
+
+**`@RefreshOnKeys`** — 注解，`String[] value()`（必填，监听的 keys），可选 `dataId()` 和 `group()`（均为空时自动解析）。不含 `@Scope`，作用域通过编程方式设置。
+
+**`RefreshOnKeysPostProcessor`**（BDRPP）— 在 Bean 定义注册后处理阶段扫描所有 Bean 定义。通过反射直接设置 `AbstractBeanDefinition` 的 `proxyMode` 字段（兼容 Spring 5.x 中 `setProxyMode` 可能不可访问的场景）。Order = `HIGHEST_PRECEDENCE + 10`。
+
+**`MetadataCollector`** — 两阶段数据结构：BDRPP 阶段收集原始数据，`ApplicationReadyEvent` 时一次性构建提交索引。使用 `ConcurrentHashMap` 保证线程安全，`volatile committedIndex` 保证安全发布。内部类：`DataGroupKey`（不可变的 (dataId, group) 对）、`IndexEntry`（含 `findAffectedBeans()` 的反向索引）。
+
+**`ConditionalRefreshScope`** — 扩展 Spring Cloud 的 `GenericScope`，名称为 `"conditionalRefresh"`。`refresh()` 仅销毁旧实例；新实例在下次 scoped-proxy 访问时惰性创建。`destroyMethod` 异常被吞掉（仅 warn 日志，不传播）。**返回值 `true` 表示"旧实例已销毁"，而非"新实例已创建"。**
+
+**`ConditionalRefreshListener`** — 编排完整流水线。使用按 bean 粒度的 `ReentrantLock`（不同 bean 并行刷新，同一 bean 串行）。通过 `Metrics.globalRegistry` 集成 Micrometer（可选 — 无硬依赖）。`recordSuccess` 在旧实例销毁后调用（而非新实例创建后）。
+
+**`Debouncer`** — 按 (dataId, group) 独立的 `ScheduledExecutorService`，固定线程池（默认 = `max(2, CPU 核心数)`）。允许不同 bean 并行刷新，同一 bean 并发由外层 `ReentrantLock` 控制。默认去抖窗口 500ms，可通过 `conditional.refresh.debounce.delay` 配置。
+
+**`ListenerContext`** — 持有 `AtomicReference<Map>` 用于配置快照（Nacos 回调中安全地原子读写），将 `findAffectedBeans()` 委托给 `MetadataCollector.IndexEntry`，并拥有一个 `Debouncer`。
+
+**`ConfigDiffUtils`** — 同时解析 Properties 和 YAML 格式（启发式规则：含 `:` 且不以 `[` 开头 → YAML）。YAML 解析失败时回退到 Properties。`diff()` 将 key 删除视为无变更，以减少不必要的刷新。
+
+**`RefreshFailedException`** — `@Deprecated`，预留。当前框架使用日志 + Micrometer 指标替代刷新失败时的异常抛出。
+
+### 自动配置条件
+
+`ConditionalRefreshAutoConfiguration` 中全部 5 个 Bean 均受以下条件约束：
+- `@ConditionalOnClass(NacosConfigManager)` — classpath 中存在 Nacos Config
+- `@ConditionalOnBean(NacosConfigManager)` — Nacos 自动配置已激活
+- `@ConditionalOnProperty(conditional.refresh.enabled=true, matchIfMissing)`
+- `@AutoConfigureAfter(NacosConfigAutoConfiguration)`
+
+所有 Bean 使用 `@ConditionalOnMissingBean`，允许用户覆盖任意组件。
+
+### 配置属性（前缀：`conditional.refresh`）
+
+| 属性 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `true` | 总开关 |
+| `debounce.delay` | `500` ms | 去抖窗口 |
+| `metrics-enabled` | `true` | 是否暴露 Micrometer 计数器 |
+| `initial-snapshot-enabled` | `true` | 注册监听器前先获取快照 |
+
+### Spring Boot 版本兼容性
+
+双注册自动配置：
+- `META-INF/spring.factories`（Spring Boot 2.x）
+- `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`（Spring Boot 3.x）
+
+目标版本：Spring Boot 2.7.18，Spring Cloud 2021.0.8，Spring Cloud Alibaba 2021.0.5.0。
+
+### 并发安全设计
+
+| 机制 | 用途 |
+|------|------|
+| `AtomicReference<Map>`（快照） | Nacos 回调中安全地原子读写旧/新快照 |
+| `ConcurrentHashMap`（contexts, beanLocks） | 线程安全的惰性初始化 |
+| `ReentrantLock` per bean | 同一 bean 串行，不同 bean 并行 |
+| `Debouncer` per (dataId, group) | 抑制快速重复刷新触发；线程池支持并行执行 |
+| `volatile committedIndex` | 构建完成的索引的安全发布 |
+
+### Micrometer 指标（可选，无硬 classpath 依赖）
+
+- `conditional.refresh.success` 计数器（tag: bean 名称）— 旧实例销毁后递增
+- `conditional.refresh.failure` 计数器（tag: bean 名称）— 刷新异常时递增
+- 通过 `Metrics.globalRegistry` 访问，带 try/catch 保护 — 框架在 Micrometer 缺失时绝不抛异常
+
+### 测试覆盖
+
+| 测试类 | 覆盖组件 | 用例数 |
+|--------|----------|--------|
+| `ConfigDiffUtilsTest` | `ConfigDiffUtils` | 11（parse、diff、e2e、blank） |
+| `DebouncerTest` | `Debouncer` | 6（dedup、exception、shutdown） |
+| `DebouncerConcurrencyTest` | `Debouncer` 并发 | 3（parallel、dedup、single-thread） |
+| `MetadataCollectorTest` | `MetadataCollector` | 9（index、fallback、placeholder） |
+| `ConditionalRefreshScopeTest` | `ConditionalRefreshScope` | 7（destroy、lazy recreate、edge cases） |
+| `ListenerContextTest` | `ListenerContext` | 7（delegation、snapshot、unmodifiable） |
+| `ConditionalRefreshListenerTest` | `ConditionalRefreshListener` | 5（register、disable、close） |
