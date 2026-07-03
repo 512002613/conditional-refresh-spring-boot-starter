@@ -87,16 +87,41 @@ conditional:
 | 两者同时变更 | ✅ 重建 | ✅ 重建（各自独立） |
 | `cos.endpoint` 内容不变（无 diff） | ❌ 不动 | ❌ 不动 |
 
-## 端到端集成测试
+## 测试验证模块
 
-框架提供基于真实 Nacos 服务器的端到端测试套件（位于下游 `tornado-facade-service` 项目），通过 `ConfigService.publishConfig()` 模拟 Nacos 服务端推送，覆盖以下场景：
+项目内置 `conditional-refresh-test-sample` 模块，无需外部项目即可验证框架功能：
 
-- Context 加载与反向索引构建
-- Nacos Listener 注册（含 file-extension 兼容）
-- 精准刷新（指定 key 变更仅刷新对应 Bean）
-- 未监听 Key 不影响刷新
-- 多 dataId/group 独立刷新
-- destroyMethod 与惰性实例化
+```bash
+# 构建整个项目
+mvn clean package -DskipTests
+
+# 运行测试验证应用
+java -jar conditional-refresh-test-sample/target/conditional-refresh-test-sample-1.0.0.jar
+```
+
+启动后通过 REST 端点验证：
+
+```bash
+# 查看当前 Bean 值
+curl http://localhost:8080/test/channel-sign
+curl http://localhost:8080/test/template
+curl http://localhost:8080/test/feature
+
+# 健康检查
+curl http://localhost:8080/test/health
+```
+
+**切换 Nacos 环境**：只需修改 `conditional-refresh-test-sample/pom.xml` 中的三个属性：
+
+```xml
+<nacos.server-addr>你的Nacos地址:8848</nacos.server-addr>
+<nacos.namespace>你的namespace</nacos.namespace>
+<nacos.group>你的group</nacos.group>
+```
+
+重新构建即可，无需修改任何 YAML 配置文件。
+
+> **注意**：集成测试（`ConditionalRefreshSampleTest`）需要连接真实 Nacos 服务器。结构与下游 `tornado-facade-service` 的 E2E 测试一致。
 
 ## 设计架构
 

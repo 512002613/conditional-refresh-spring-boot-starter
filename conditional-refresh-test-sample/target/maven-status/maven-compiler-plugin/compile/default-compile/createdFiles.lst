@@ -1,0 +1,6 @@
+com\liu\conditionalrefresh\test\TestBeans$TemplateService.class
+com\liu\conditionalrefresh\test\TestController.class
+com\liu\conditionalrefresh\test\TestBeans.class
+com\liu\conditionalrefresh\test\TestSampleApplication.class
+com\liu\conditionalrefresh\test\TestBeans$FeatureToggleService.class
+com\liu\conditionalrefresh\test\TestBeans$ChannelSignService.class

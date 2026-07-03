@@ -1,0 +1,43 @@
+# ════════════════════════════════════════════════════════════════
+# 条件刷新测试验证模块 —— 应用配置
+# ════════════════════════════════════════════════════════════════
+
+server:
+  port: 8080
+
+spring:
+  autoconfigure:
+    exclude:
+      # 禁用需要外部基础设施的自动配置
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+
+# 条件刷新框架自身配置
+conditional:
+  refresh:
+    enabled: true
+    debounce:
+      delay: 500
+    metrics-enabled: true
+    initial-snapshot-enabled: true
+
+# 被监听的配置 Key 初始值（作为默认值，实际值以 Nacos 服务端为准）
+channel:
+  sign:
+    secret: "default-secret"
+    token: "default-token"
+template:
+  max:
+    retry: 3
+  timeout: 5000
+custom:
+  feature:
+    enabled: false
+
+# 日志级别
+logging:
+  level:
+    com.liu.conditionalrefresh: DEBUG
+    com.liu.conditionalrefresh.test: DEBUG

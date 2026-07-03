@@ -1,0 +1,35 @@
+{
+  "groups": [
+    {
+      "name": "conditional.refresh",
+      "type": "com.liu.conditionalrefresh.config.ConditionalRefreshProperties",
+      "description": "条件刷新框架全局配置。"
+    }
+  ],
+  "properties": [
+    {
+      "name": "conditional.refresh.enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否启用条件刷新功能。设为 false 后，所有 @RefreshOnKeys 标记的 Bean 退化为普通单例。",
+      "defaultValue": true
+    },
+    {
+      "name": "conditional.refresh.debounce-delay",
+      "type": "java.lang.Long",
+      "description": "去抖静默窗口大小（毫秒）。当同一 Bean 在静默窗口内收到多次刷新通知时，只执行最后一次。",
+      "defaultValue": 500
+    },
+    {
+      "name": "conditional.refresh.metrics-enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否暴露 Micrometer 监控指标（conditional.refresh.success / failure）。",
+      "defaultValue": true
+    },
+    {
+      "name": "conditional.refresh.initial-snapshot-enabled",
+      "type": "java.lang.Boolean",
+      "description": "是否在注册 Nacos 监听器前主动获取初始配置快照，避免首次推送的全量刷新。",
+      "defaultValue": true
+    }
+  ]
+}

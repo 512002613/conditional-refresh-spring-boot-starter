@@ -4,6 +4,42 @@
 
 ### 新增
 
+#### 3. 新增 test-sample 测试验证模块（P1）
+
+**内容**：在项目内部新增 `conditional-refresh-test-sample` 测试验证模块，将项目从单模块重构为多模块 Maven 项目：
+- 父 POM：`conditional-refresh-spring-boot-starter-parent`（packaging=pom）
+- starter 子模块：现有核心保持不变（jar）
+- test-sample 子模块：可运行应用 + JUnit 集成测试
+
+**test-sample 模块特性**：
+- 可运行 Spring Boot 应用（`TestSampleApplication`），提供 REST 端点（`/test/channel-sign`、`/test/template`、`/test/feature`、`/test/health`）
+- JUnit 集成测试（`ConditionalRefreshSampleTest`），使用真实 Nacos 服务器，覆盖 7 个场景
+- Nacos 连接信息通过 Maven 资源过滤占位符（`@nacos.server-addr@` 等）注入，切换环境只需修改 pom.xml 中三个 `<property>` 值
+- 只需替换 Nacos 服务地址即可在任何环境测试验证
+
+**测试结果**：
+```
+starter 模块: Tests run: 48, Failures: 0, Errors: 0, Skipped: 0 (单元测试)
+test-sample 模块: 集成测试需连接真实 Nacos 服务器（结构与 tornado-facade-service 的 E2E 测试一致）
+BUILD SUCCESS
+```
+
+### 文件变更清单
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `pom.xml` | 修改 | 根 POM 改为父 POM（packaging=pom），聚合两个子模块 |
+| `conditional-refresh-spring-boot-starter/pom.xml` | 新增 | starter 子模块 POM |
+| `conditional-refresh-test-sample/pom.xml` | 新增 | test-sample 模块 POM（含 Maven 资源过滤配置） |
+| `conditional-refresh-test-sample/src/main/resources/bootstrap.yml` | 新增 | Nacos 连接配置（使用占位符） |
+| `conditional-refresh-test-sample/src/main/resources/application.yml` | 新增 | 应用配置 |
+| `conditional-refresh-test-sample/src/main/java/.../TestSampleApplication.java` | 新增 | 应用入口 |
+| `conditional-refresh-test-sample/src/main/java/.../TestBeans.java` | 新增 | @RefreshOnKeys 示例 Bean |
+| `conditional-refresh-test-sample/src/main/java/.../TestController.java` | 新增 | REST 端点 |
+| `conditional-refresh-test-sample/src/test/java/.../ConditionalRefreshSampleTest.java` | 新增 | JUnit 集成测试 |
+| `conditional-refresh-test-sample/src/test/resources/application-test.yml` | 新增 | 测试配置 |
+| `CLAUDE.md` | 修改 | 更新模块结构、构建命令、测试覆盖 |
+
 #### 1. Nacos file-extension 兼容（P1）
 
 **原因**：Nacos 2.x 客户端在 `file-extension: yaml` 时，实际存储/监听的 dataId 会自动追加 `.yaml` 后缀，但 starter 注册条件刷新监听器时仅使用原始 dataId（不含后缀），导致监听器无法收到 Nacos 服务端的推送通知。

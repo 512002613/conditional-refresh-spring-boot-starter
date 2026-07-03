@@ -1,0 +1,33 @@
+# ════════════════════════════════════════════════════════════════
+# 条件刷新测试验证模块 —— Bootstrap 配置
+#
+# 本文件使用 Maven 资源过滤占位符（@placeholder@ 语法），
+# 实际值来自 pom.xml 中的 <properties>。
+# 切换 Nacos 环境只需修改 pom.xml 中以下三个值：
+#   - nacos.server-addr
+#   - nacos.namespace
+#   - nacos.group
+# ════════════════════════════════════════════════════════════════
+
+spring:
+  application:
+    name: conditional-refresh-test-sample
+  cloud:
+    nacos:
+      config:
+        server-addr: nacos01.dev02.wyc.ws.srv:8848
+        namespace: dev02
+        group: DEFAULT_GROUP
+        file-extension: yaml
+        enabled: true
+        # 共享配置：同时声明 dataId 和 dataId.yaml，兼容 Nacos 2.x file-extension 行为
+        # 确保 NacosContextRefresher 能刷新 Environment 中的配置值
+        shared-configs:
+          - data-id: conditional-refresh-test-sample
+            group: DEFAULT_GROUP
+            refresh: true
+          - data-id: conditional-refresh-test-sample.yaml
+            group: DEFAULT_GROUP
+            refresh: true
+      discovery:
+        enabled: false

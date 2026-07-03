@@ -60,17 +60,34 @@ BUILD SUCCESS
 
 一个 Spring Boot Starter，通过 `@RefreshOnKeys` 注解提供**条件配置刷新**能力。被 `@RefreshOnKeys` 标记的 Bean 仅在其监听的特定配置 Key 发生变更时才会重建 —— 与全局性的 `@RefreshScope`（任意环境变化即刷新）不同。设计目标为与 Nacos Config（Spring Cloud Alibaba）协同工作。
 
+## 模块结构
+
+```
+conditional-refresh-spring-boot-starter-parent/   ← 父 POM（聚合构建）
+├── conditional-refresh-spring-boot-starter/      ← starter 核心模块（jar）
+└── conditional-refresh-test-sample/              ← 测试验证模块（可运行应用 + JUnit）
+```
+
+### test-sample 模块
+
+- **可运行应用**：`TestSampleApplication.java`，提供 REST 端点手动验证刷新行为
+- **集成测试**：`ConditionalRefreshSampleTest.java`，使用真实 Nacos 服务器自动化验证
+- **Nacos 连接信息**：通过 Maven 资源过滤占位符注入，切换环境只需修改 `conditional-refresh-test-sample/pom.xml` 中的 `<nacos.server-addr>`、`<nacos.namespace>`、`<nacos.group>` 三个属性
+
 ## 构建与测试命令
 
 ```bash
-# 完整构建（编译 + 测试 + 打包）
+# 完整构建（编译 + 测试 + 打包，所有模块）
 cd /d/devworkspace/conditional-refresh-spring-boot-starter && mvn clean package
 
 # 跳过测试
 mvn clean package -DskipTests
 
-# 仅运行测试
-mvn test
+# 仅运行 starter 模块的单元测试
+mvn test -pl conditional-refresh-spring-boot-starter
+
+# 运行 test-sample 模块的集成测试（需要真实 Nacos 服务器）
+mvn test -pl conditional-refresh-test-sample
 
 # 运行单个测试类
 mvn test -Dtest=ConfigDiffUtilsTest
@@ -208,6 +225,8 @@ ConditionalRefreshListener.handleChange()
 
 ### 测试覆盖
 
+#### starter 模块单元测试（位于 `conditional-refresh-spring-boot-starter/src/test/`）
+
 | 测试类 | 覆盖组件 | 用例数 |
 |--------|----------|--------|
 | `ConfigDiffUtilsTest` | `ConfigDiffUtils` | 11（parse、diff、e2e、blank） |
@@ -217,3 +236,9 @@ ConditionalRefreshListener.handleChange()
 | `ConditionalRefreshScopeTest` | `ConditionalRefreshScope` | 7（destroy、lazy recreate、edge cases） |
 | `ListenerContextTest` | `ListenerContext` | 7（delegation、snapshot、unmodifiable） |
 | `ConditionalRefreshListenerTest` | `ConditionalRefreshListener` | 5（register、disable、close） |
+
+#### test-sample 模块集成测试（位于 `conditional-refresh-test-sample/src/test/`）
+
+| 测试类 | 覆盖场景 | 用例数 |
+|--------|----------|--------|
+| `ConditionalRefreshSampleTest` | 真实 Nacos 端到端（Context 加载、索引构建、精准刷新、多组独立、destroyMethod） | 7 |

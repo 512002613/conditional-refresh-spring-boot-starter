@@ -5,21 +5,25 @@
     <modelVersion>4.0.0</modelVersion>
 
     <!-- ============================================================ -->
-    <!-- 条件刷新 Spring Boot Starter                                  -->
-    <!-- 使任意 Bean 通过 @RefreshOnKeys 声明仅对指定配置 Key 敏感，       -->
-    <!-- 仅当这些 Key 变更时才重建自身，与全局 @RefreshScope 互不干扰。      -->
+    <!-- 条件刷新 Spring Boot Starter —— 父 POM                        -->
+    <!-- 聚合 starter 核心模块和 test-sample 测试验证模块                   -->
     <!-- ============================================================ -->
 
     <groupId>com.liu</groupId>
-    <artifactId>conditional-refresh-spring-boot-starter</artifactId>
+    <artifactId>conditional-refresh-spring-boot-starter-parent</artifactId>
     <version>1.0.0</version>
-    <packaging>jar</packaging>
+    <packaging>pom</packaging>
 
     <name>conditional-refresh-spring-boot-starter</name>
     <description>
         条件配置刷新框架：通过 @RefreshOnKeys 注解声明 Bean 监听的配置 Key，
         仅当这些 Key 发生变更时才重建该 Bean，与全局 @RefreshScope 互不干扰。
     </description>
+
+    <modules>
+        <module>conditional-refresh-spring-boot-starter</module>
+        <module>conditional-refresh-test-sample</module>
+    </modules>
 
     <properties>
         <!--
@@ -65,78 +69,32 @@
         </dependencies>
     </dependencyManagement>
 
-    <dependencies>
-        <!-- Spring Boot 自动配置 -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-autoconfigure</artifactId>
-        </dependency>
-
-        <!-- Spring Boot 配置元数据（让 IDE 提示条件刷新的配置项） -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-configuration-processor</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- Spring Cloud Context（提供 RefreshScope、GenericScope 等基础类） -->
-        <dependency>
-            <groupId>org.springframework.cloud</groupId>
-            <artifactId>spring-cloud-context</artifactId>
-        </dependency>
-
-        <!-- Spring Cloud Alibaba Nacos Config（Nacos 配置中心） -->
-        <dependency>
-            <groupId>com.alibaba.cloud</groupId>
-            <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- Micrometer 监控（可选，用于暴露刷新指标） -->
-        <dependency>
-            <groupId>io.micrometer</groupId>
-            <artifactId>micrometer-core</artifactId>
-            <optional>true</optional>
-        </dependency>
-
-        <!-- SLF4J 日志 -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-        </dependency>
-
-        <!-- 测试依赖 -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-
     <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
-                <configuration>
-                    <source>1.8</source>
-                    <target>1.8</target>
-                    <parameters>true</parameters>
-                    <encoding>${project.build.sourceEncoding}</encoding>
-                </configuration>
-            </plugin>
-            <!--
-            toolchains plugin removed: it was overriding the compiler target to 1.8
-            when no JDK 11 toolchain was configured, causing compilation failures
-            with Java 9+ APIs (Map.of, String.isBlank).
-            -->
-            <!-- 显式声明 surefire 2.22.2 (兼容 JDK 11 + JUnit 5) -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-                <version>2.22.2</version>
-            </plugin>
-        </plugins>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <version>${spring-boot.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.11.0</version>
+                    <configuration>
+                        <source>1.8</source>
+                        <target>1.8</target>
+                        <parameters>true</parameters>
+                        <encoding>${project.build.sourceEncoding}</encoding>
+                    </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <version>2.22.2</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
     </build>
+
 </project>

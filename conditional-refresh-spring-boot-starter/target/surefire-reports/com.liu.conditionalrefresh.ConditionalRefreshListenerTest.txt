@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: com.liu.conditionalrefresh.ConditionalRefreshListenerTest
+-------------------------------------------------------------------------------
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.475 s - in com.liu.conditionalrefresh.ConditionalRefreshListenerTest
