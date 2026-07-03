@@ -36,7 +36,7 @@
 
 ### 第 1 步：`RefreshOnKeys.java` — 注解定义
 
-**路径**: `src/main/java/com/example/conditionalrefresh/annotation/RefreshOnKeys.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/annotation/RefreshOnKeys.java`
 
 **阅读目标**: 理解框架对外暴露的 API 形态。
 
@@ -58,7 +58,7 @@
 
 ### 第 2 步：`ConditionalRefreshProperties.java` — 配置绑定
 
-**路径**: `src/main/java/com/example/conditionalrefresh/config/ConditionalRefreshProperties.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/config/ConditionalRefreshProperties.java`
 
 **阅读目标**: 了解所有可配置项及其默认值。
 
@@ -77,7 +77,7 @@
 
 ### 第 3 步：`ConditionalRefreshAutoConfiguration.java` — 自动配置
 
-**路径**: `src/main/java/com/example/conditionalrefresh/config/ConditionalRefreshAutoConfiguration.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/config/ConditionalRefreshAutoConfiguration.java`
 
 **阅读目标**: 理解框架的 Bean 装配条件和顺序。
 
@@ -104,8 +104,8 @@
 ### 第 4 步：`ConditionalRefreshScope.java` + `ConditionalScopeRegistrar.java`
 
 **路径**:
-- `src/main/java/com/example/conditionalrefresh/scope/ConditionalRefreshScope.java`
-- `src/main/java/com/example/conditionalrefresh/scope/ConditionalScopeRegistrar.java`
+- `src/main/java/com/liu/conditionalrefresh/scope/ConditionalRefreshScope.java`
+- `src/main/java/com/liu/conditionalrefresh/scope/ConditionalScopeRegistrar.java`
 
 **阅读目标**: 理解自定义作用域的生命周期。
 
@@ -140,7 +140,7 @@ scope 实例来自容器注入（非 new），保证全局唯一
 
 ### 第 5 步：`RefreshOnKeysPostProcessor.java` — Bean 定义扫描改写
 
-**路径**: `src/main/java/com/example/conditionalrefresh/processor/RefreshOnKeysPostProcessor.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/processor/RefreshOnKeysPostProcessor.java`
 
 **阅读目标**: 理解 `@RefreshOnKeys` 如何被识别、改写和收集。
 
@@ -185,7 +185,7 @@ proxyModeField.setInt(abd, ScopedProxyMode.TARGET_CLASS.ordinal());
 
 ### 第 6 步：`MetadataCollector.java` — 元数据收集器
 
-**路径**: `src/main/java/com/example/conditionalrefresh/processor/MetadataCollector.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/processor/MetadataCollector.java`
 
 **阅读目标**: 理解反向索引的数据结构和构建时机。
 
@@ -224,7 +224,7 @@ buildCommittedIndex(env) —— 一次性构建
 
 ### 第 7 步：`ConditionalRefreshListener.java` — 核心调度器
 
-**路径**: `src/main/java/com/example/conditionalrefresh/listener/ConditionalRefreshListener.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/listener/ConditionalRefreshListener.java`
 
 **阅读目标**: 理解配置变更如何驱动 Bean 刷新。
 
@@ -238,8 +238,19 @@ onApplicationEvent(ApplicationReadyEvent)
   └─ ④ 遍历 (dataId, group) 组合 → registerListener()
       ├─ 4a. fetchInitialSnapshot()  → 获取初始快照（避免首次全量刷新）
       ├─ 4b. new ListenerContext()    → 创建上下文（含快照、去抖器）
-      └─ 4c. configService.addListener()  → 注册 Nacos 监听器
+      ├─ 4c. addNacosListener(dataId, group)  → 注册原始 dataId 监听器
+      └─ 4d. 若 file-extension 非空且 dataId 未以后缀结尾
+          └─ addNacosListener(dataId + "." + ext, group)  → 同时注册带后缀监听器
 ```
+
+#### file-extension 双监听器机制
+
+Nacos 2.x 在 `file-extension: yaml` 时，实际存储/推送的 dataId 会追加 `.yaml` 后缀。框架通过以下机制兼容：
+
+1. **注册阶段**：`registerListener()` 自动检测 `spring.cloud.nacos.config.file-extension`，若存在则同时注册 `dataId` 与 `dataId.fileExtension` 两个 Nacos 监听器
+2. **回调阶段**：`getContext()` 先按原始 dataId 查找，若失败且 dataId 以扩展名后缀结尾，则去除后缀后回退查找
+
+这保证了无论 Nacos 服务端以哪种 dataId 形式推送，框架均能正确路由到对应的 `ListenerContext`。
 
 #### 运行时处理流程（每次配置变更）
 
@@ -275,7 +286,7 @@ handleChange(dataId, group, configInfo)
 
 #### 8.1 `ConfigDiffUtils.java` — 配置解析与 diff
 
-**路径**: `src/main/java/com/example/conditionalrefresh/listener/ConfigDiffUtils.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/listener/ConfigDiffUtils.java`
 
 ```
 parse(configText)
@@ -294,7 +305,7 @@ diff(oldSnapshot, newSnapshot)
 
 #### 8.2 `Debouncer.java` — 去抖器
 
-**路径**: `src/main/java/com/example/conditionalrefresh/listener/Debouncer.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/listener/Debouncer.java`
 
 ```
 debounce(key, task)
@@ -307,29 +318,30 @@ debounce(key, task)
           └─ 异常→ log.error() + recordFailure()
 ```
 
-**为什么是单线程调度器？**
-- 保证同一时刻只有一个刷新任务在执行
-- 天然串行化，避免并发问题
-- 配合外层 Bean 级锁，形成完整的并发控制
+**为什么是多线程池调度器？**
+- 默认线程池大小为 `max(2, CPU 核心数)`
+- 不同 (dataId, group) 的刷新任务可并行执行
+- 同一 key 的去重由 `pending ConcurrentHashMap` 保证
+- 配合外层 Bean 级锁，形成完整的并发控制（同一 Bean 串行，不同 Bean 并行）
 
 #### 8.3 `ListenerContext.java` — 监听器上下文
 
-**路径**: `src/main/java/com/example/conditionalrefresh/listener/ListenerContext.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/listener/ListenerContext.java`
 
 ```
 每个 (dataId, group) 对应一个 ListenerContext 实例：
   ├─ lastSnapshot:  AtomicReference<Map>     ← 原子快照
-  ├─ keyToBeans:    Map<String, Set<String>> ← 反向索引
-  └─ debouncer:     Debouncer                ← 去抖器
+  ├─ indexEntry:    IndexEntry               ← 反向索引（委托 findAffectedBeans）
+  └─ debouncer:     Debouncer                ← 去抖器（多线程池）
 ```
 
 #### 8.4 `RefreshFailedException.java` — 刷新失败异常
 
-**路径**: `src/main/java/com/example/conditionalrefresh/exception/RefreshFailedException.java`
+**路径**: `src/main/java/com/liu/conditionalrefresh/exception/RefreshFailedException.java`
 
 - 携带 `beanName` 和原始 `cause`
-- **当前版本未主动抛出**（预留用于未来扩展）
-- 框架当前策略：刷新失败 → log.error → 不阻塞其他 Bean
+- **`@Deprecated`**：当前版本未主动抛出（预留用于未来扩展）
+- 框架当前策略：刷新失败 → log.error + Micrometer 指标 → 不阻塞其他 Bean
 
 ---
 
@@ -421,6 +433,7 @@ Spring Boot 启动
 | 惰性重建（不立即创建） | `ConditionalRefreshScope` | 不阻塞 Nacos 回调线程 |
 | Micrometer 弱依赖 | `Debouncer`, `Listener` | 框架不要求必须引入 Micrometer |
 | proxyMode 反射设置 | `RefreshOnKeysPostProcessor` | 兼容 Spring 5.x 全系列 |
+| file-extension 双监听器 | `ConditionalRefreshListener` | 兼容 Nacos 2.x 自动追加扩展名行为 |
 
 ---
 
@@ -428,9 +441,15 @@ Spring Boot 启动
 
 | 测试类 | 覆盖模块 | 关键测试点 |
 |--------|----------|------------|
-| `ConfigDiffUtilsTest` | `ConfigDiffUtils` | Properties/YAML 解析、diff 语义、空配置边界 |
-| `DebouncerTest` | `Debouncer` | 正常执行、去抖去重、异常不阻断、shutdown 行为 |
-| `MetadataCollectorTest` | `MetadataCollector` | 空检查、占位符解析、反向索引正确性、重复构建保护 |
+| `ConfigDiffUtilsTest` | `ConfigDiffUtils` | Properties/YAML 解析、diff 语义、空配置边界（11 用例） |
+| `DebouncerTest` | `Debouncer` | 正常执行、去抖去重、异常不阻断、shutdown 行为（6 用例） |
+| `DebouncerConcurrencyTest` | `Debouncer` 并发 | 不同 key 并行、同 key 去重、单线程池退化（3 用例） |
+| `MetadataCollectorTest` | `MetadataCollector` | 空检查、占位符解析、反向索引正确性、重复构建保护（9 用例） |
+| `ConditionalRefreshScopeTest` | `ConditionalRefreshScope` | 常量验证、不存在 Bean、空/null 名称、惰性重建（7 用例） |
+| `ListenerContextTest` | `ListenerContext` | 委托行为、单 key 影响、未监听 key、快照原子替换（7 用例） |
+| `ConditionalRefreshListenerTest` | `ConditionalRefreshListener` | 监听器注册、配置变更触发、全局开关、close 释放（5 用例） |
+| `ConditionalRefreshEndToEndTest` | 集成测试（Mock） | 7 个场景全覆盖（Mock Nacos + 可变 PropertySource） |
+| `ConditionalRefreshE2ETest` | 端到端测试（真实 Nacos） | 7 个场景、真实 `ConfigService.publishConfig()` 推送 |
 
 ---
 

@@ -2,6 +2,42 @@
 
 ## [Unreleased] - 2026-07-03
 
+### 新增
+
+#### 1. Nacos file-extension 兼容（P1）
+
+**原因**：Nacos 2.x 客户端在 `file-extension: yaml` 时，实际存储/监听的 dataId 会自动追加 `.yaml` 后缀，但 starter 注册条件刷新监听器时仅使用原始 dataId（不含后缀），导致监听器无法收到 Nacos 服务端的推送通知。
+
+**影响**：使用 `@RefreshOnKeys` 监听独立 Nacos dataId 且 Nacos 配置了 `file-extension: yaml`（或 `properties`）时，条件刷新完全静默失败。
+
+**修复**：
+- `ConditionalRefreshListener.addListener()` 新增 file-extension 感知逻辑，自动同时注册 `dataId` 与 `dataId.fileExtension` 两个 Nacos 监听器
+- `getContext()` 方法新增“去除扩展名后回退查找”逻辑，使 dataId 回调无论带不带扩展名均能找到已注册的 ListenerContext
+
+### 文件变更清单
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `src/main/java/.../listener/ConditionalRefreshListener.java` | 修改 | addNacosListener 拆分 + file-extension 兼容处理 |
+
+#### 2. 真实 Nacos 端到端集成测试套件（P1）
+
+**内容**：新建 `ConditionalRefreshE2ETest.java`（位于 `tornado-facade-service` 项目），使用真实 Nacos 服务器（`nacos01.dev02.wyc.ws.srv:8848`），通过 `ConfigService.publishConfig()` 模拟 Nacos 服务端推送，完整覆盖 7 个场景：
+- Context 加载
+- 反向索引构建
+- Nacos Listener 注册
+- channel.sign.* 精准刷新
+- 未监听 Key 不影响刷新
+- 多 dataId/group 独立刷新
+- destroyMethod + 惰性实例化
+
+**测试结果**：
+```
+Tests run: 7, Failures: 0, Errors: 0, Skipped: 0 (E2E)
+Tests run: 48, Failures: 0, Errors: 0, Skipped: 0 (单元测试)
+BUILD SUCCESS
+```
+
 ### 修复（第二轮 P2 清理）
 
 #### 1. pom.xml Java 版本属性对齐（P2）

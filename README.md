@@ -18,7 +18,7 @@
 
 ```xml
 <dependency>
-    <groupId>com.example</groupId>
+    <groupId>com.liu</groupId>
     <artifactId>conditional-refresh-spring-boot-starter</artifactId>
     <version>1.0.0</version>
 </dependency>
@@ -64,10 +64,19 @@ public class SmsService { }
 conditional:
   refresh:
     enabled: true                 # 默认 true
-    debounce-delay: 500           # 去抖窗口 ms，默认 500
+    debounce.delay: 500           # 去抖窗口 ms，默认 500
     metrics-enabled: true         # 暴露 Micrometer 指标
     initial-snapshot-enabled: true  # 首次注册拉取快照
 ```
+
+## Nacos file-extension 兼容
+
+当 Nacos 配置 `file-extension: yaml`（或 `properties`）时，Nacos 2.x 服务端实际存储和推送的 dataId 会自动追加扩展名后缀（例如 `myapp` → `myapp.yaml`）。框架已内置兼容处理：
+
+- 注册 Nacos 监听器时，自动同时注册 `dataId` 与 `dataId.fileExtension` 两个监听器
+- 接收推送时，无论 Nacos 回调返回哪个 dataId 形式，均能正确找到对应的 `ListenerContext`
+
+**无需额外配置**，框架自动从 `spring.cloud.nacos.config.file-extension` 感知当前后缀。
 
 ## 行为说明
 
@@ -77,6 +86,17 @@ conditional:
 | `cos.tencent.secretId` 变更 | ❌ 不动 | ✅ 重建 |
 | 两者同时变更 | ✅ 重建 | ✅ 重建（各自独立） |
 | `cos.endpoint` 内容不变（无 diff） | ❌ 不动 | ❌ 不动 |
+
+## 端到端集成测试
+
+框架提供基于真实 Nacos 服务器的端到端测试套件（位于下游 `tornado-facade-service` 项目），通过 `ConfigService.publishConfig()` 模拟 Nacos 服务端推送，覆盖以下场景：
+
+- Context 加载与反向索引构建
+- Nacos Listener 注册（含 file-extension 兼容）
+- 精准刷新（指定 key 变更仅刷新对应 Bean）
+- 未监听 Key 不影响刷新
+- 多 dataId/group 独立刷新
+- destroyMethod 与惰性实例化
 
 ## 设计架构
 

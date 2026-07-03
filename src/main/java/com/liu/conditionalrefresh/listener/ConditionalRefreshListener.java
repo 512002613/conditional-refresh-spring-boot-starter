@@ -178,6 +178,12 @@ public class ConditionalRefreshListener
      * <p><strong>关键</strong>：注册前先主动获取一次当前配置作为初始快照，
      * 避免首次推送被误判为"所有 key 都新增"从而导致无谓的全量刷新。
      *
+     * <p><strong>file-extension 处理</strong>：Spring Cloud Alibaba 的 Nacos 客户端
+     * 在 {@code file-extension} 非空时，实际存储的 dataId 为 {@code dataId.fileExtension}
+     * （例如 dataId=app + file-extension=yaml → 实际 dataId=app.yaml）。
+     * 为确保条件刷新监听器能接收到 Nacos 推送，本方法会同时注册原始 dataId 和
+     * 带扩展名的 dataId 两个监听器（如果扩展名非空且 dataId 尚未以扩展名结尾）。
+     *
      * @param dataId Nacos Data ID
      * @param group  Nacos Group
      * @param entry  该组的反向索引条目
@@ -191,7 +197,25 @@ public class ConditionalRefreshListener
         ListenerContext ctx = new ListenerContext(entry, initialSnapshot);
         contexts.computeIfAbsent(dataId, k -> new ConcurrentHashMap<>()).put(group, ctx);
 
-        // 3. 注册 Nacos 监听器
+        // 3. 注册 Nacos 监听器（原始 dataId）
+        addNacosListener(dataId, group);
+
+        // 4. 如果 file-extension 非空且 dataId 尚未以扩展名结尾，额外注册带扩展名的 dataId
+        String fileExtension = environment.getProperty("spring.cloud.nacos.config.file-extension");
+        if (fileExtension != null && !fileExtension.isEmpty()
+                && !dataId.endsWith("." + fileExtension)) {
+            String dataIdWithExt = dataId + "." + fileExtension;
+            addNacosListener(dataIdWithExt, group);
+        }
+    }
+
+    /**
+     * 向 Nacos 注册单个监听器。
+     *
+     * @param dataId Nacos Data ID
+     * @param group  Nacos Group
+     */
+    private void addNacosListener(String dataId, String group) {
         try {
             nacosConfigManager.getConfigService().addListener(dataId, group, new Listener() {
                 @Override
@@ -321,14 +345,31 @@ public class ConditionalRefreshListener
     /**
      * 获取指定 (dataId, group) 的监听器上下文。
      *
+     * <p>自动兼容带 file-extension 后缀的 dataId：如果直接查询不到，
+     * 尝试去掉 {@code .fileExtension} 后缀后重试（Spring Cloud Alibaba 实际存储的
+     * dataId 可能为 {@code dataId.yaml}）。
+     *
      * @param dataId Nacos Data ID
      * @param group  Nacos Group
      * @return 对应的 {@link ListenerContext}，若不存在返回 {@code null}
      */
     private ListenerContext getContext(String dataId, String group) {
         Map<String, ListenerContext> groupMap = contexts.get(dataId);
-        if (groupMap == null) return null;
-        return groupMap.get(group);
+        if (groupMap != null) {
+            ListenerContext ctx = groupMap.get(group);
+            if (ctx != null) return ctx;
+        }
+        // 尝试去掉 file-extension 后缀后重试
+        String fileExtension = environment.getProperty("spring.cloud.nacos.config.file-extension");
+        if (fileExtension != null && !fileExtension.isEmpty()
+                && dataId.endsWith("." + fileExtension)) {
+            String baseDataId = dataId.substring(0, dataId.length() - fileExtension.length() - 1);
+            Map<String, ListenerContext> baseGroupMap = contexts.get(baseDataId);
+            if (baseGroupMap != null) {
+                return baseGroupMap.get(group);
+            }
+        }
+        return null;
     }
 
     /**
