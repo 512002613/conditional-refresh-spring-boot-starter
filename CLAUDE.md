@@ -65,8 +65,21 @@ BUILD SUCCESS
 ```
 conditional-refresh-spring-boot-starter-parent/   ← 父 POM（聚合构建）
 ├── conditional-refresh-spring-boot-starter/      ← starter 核心模块（jar）
-└── conditional-refresh-test-sample/              ← 测试验证模块（可运行应用 + JUnit）
+├── conditional-refresh-test-sample/              ← SB2.7 测试验证模块（可运行应用 + JUnit）
+├── conditional-refresh-test-sample-v3/           ← SB3.5 测试验证模块（独立项目）
+└── conditional-refresh-test-sample-v4/           ← SB4.0 测试验证模块（独立项目）
 ```
+
+### Spring Boot 版本矩阵
+
+| 模块 | Spring Boot | Spring Cloud | Spring Cloud Alibaba | Java |
+|------|-------------|--------------|---------------------|------|
+| starter | 2.7.18 | 2021.0.8 | 2021.0.5.0 | 1.8 |
+| test-sample | 2.7.18 | 2021.0.8 | 2021.0.5.0 | 1.8 |
+| test-sample-v3 | 3.5.x | 2023.0.x | 2023.0.3.0 | 17 |
+| test-sample-v4 | 4.0.x | 2023.0.x | 2023.0.3.0 | 17 |
+
+> **注意**：v3/v4 模块使用独立的 Spring Boot BOM，不继承父 POM。构建时需确保 Maven 镜像包含对应版本的 Spring Cloud Alibaba BOM。如 corporate mirror 不可用，可通过 `-Dspring-cloud-alibaba.version=...` 覆盖版本号。
 
 ### test-sample 模块
 

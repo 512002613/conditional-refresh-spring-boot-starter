@@ -1,0 +1,65 @@
+# ════════════════════════════════════════════════════════════════
+# 条件刷新测试验证模块 — Spring Boot 3.5.x
+# ════════════════════════════════════════════════════════════════
+
+server:
+  port: 8083
+
+spring:
+  application:
+    name: conditional-refresh-test-sample-v3
+  # Spring Boot 3+ 标准方式：通过 config.import 引入 Nacos 配置
+  config:
+    import: nacos:
+  cloud:
+    # 同时启用 legacy bootstrap 模式（兼容 bootstrap.yml 中的占位符注入）
+    bootstrap:
+      enabled: true
+    nacos:
+      config:
+        server-addr: @nacos.server-addr@
+        namespace: @nacos.namespace@
+        group: @nacos.group@
+        file-extension: yaml
+        enabled: true
+        shared-configs:
+          - data-id: conditional-refresh-test-sample-v3
+            group: @nacos.group@
+            refresh: true
+          - data-id: conditional-refresh-test-sample-v3.yaml
+            group: @nacos.group@
+            refresh: true
+      discovery:
+        enabled: false
+
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+
+conditional:
+  refresh:
+    enabled: true
+    debounce:
+      delay: 500
+    metrics-enabled: true
+    initial-snapshot-enabled: true
+
+channel:
+  sign:
+    secret: "default-secret"
+    token: "default-token"
+template:
+  max:
+    retry: 3
+  timeout: 5000
+custom:
+  feature:
+    enabled: false
+
+logging:
+  level:
+    com.liu.conditionalrefresh: DEBUG
+    com.liu.conditionalrefresh.test: DEBUG
