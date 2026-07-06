@@ -2,6 +2,10 @@
 
 本文件为 Claude Code (claude.ai/code) 提供本仓库的代码工作指引。
 
+## 提交信息规范
+
+**禁止**在提交信息中添加 `Co-Authored-By` 行（包括 `Co-Authored-By: Claude <noreply@anthropic.com>` 或任何变体）。本仓库的所有提交**仅保留真实人类贡献者信息**，不要写入任何 AI 协作者 trailer。
+
 ## 变更日志维护
 
 每次**新需求完成**或 **bug 修复变更**完成后，必须在 [`CHANGELOG.md`](./CHANGELOG.md) 顶部 `[Unreleased]` 段落中追加对应的变更记录。
