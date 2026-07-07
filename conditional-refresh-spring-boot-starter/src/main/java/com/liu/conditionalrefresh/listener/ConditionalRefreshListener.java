@@ -1,67 +1,71 @@
 package com.liu.conditionalrefresh.listener;
 
-import com.alibaba.cloud.nacos.NacosConfigManager;
-import com.alibaba.nacos.api.config.listener.Listener;
-import com.alibaba.nacos.api.exception.NacosException;
 import com.liu.conditionalrefresh.processor.MetadataCollector;
 import com.liu.conditionalrefresh.processor.RefreshOnKeysPostProcessor;
 import com.liu.conditionalrefresh.scope.ConditionalRefreshScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.cloud.context.environment.EnvironmentChangeEvent;
+import org.springframework.cloud.context.scope.refresh.RefreshScopeRefreshedEvent;
+import org.springframework.context.ApplicationEvent;
 import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.SmartApplicationListener;
+import org.springframework.core.Ordered;
 import org.springframework.core.env.Environment;
 
-import java.util.Collections;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 条件刷新监听器：在应用就绪后为每个 (dataId, group) 注册 Nacos 配置监听器，
- * 并在配置变更时按反向索引精准刷新受影响的 Bean。
+ * 条件刷新监听器：监听 Spring 环境变更事件，按反向索引精准刷新受影响的 Bean。
  *
- * <h3>工作流程</h3>
+ * <h2>工作流程（PropertySource-First）</h2>
  * <ol>
- *     <li>等待 {@link ApplicationReadyEvent}（确保 Nacos 客户端和 Environment 就绪）。</li>
+ *     <li>等待 {@link ApplicationReadyEvent}（确保 Environment 和 Nacos 客户端就绪）。</li>
  *     <li>调用 {@link MetadataCollector#buildCommittedIndex} 解析占位符并构建反向索引。</li>
- *     <li>为每个 (dataId, group)：
+ *     <li>监听 {@link EnvironmentChangeEvent}（PropertySource 更新后发布，携带 changedKeys）：
  *         <ul>
- *             <li>通过 {@code configService.getConfig()} 获取<b>初始配置快照</b>（避免首次推送全量刷新）。</li>
- *             <li>注册 Nacos {@link Listener}，在回调中执行 diff → 反向索引 → 去抖刷新。</li>
+ *             <li>通过反向索引（精确 + 前缀匹配）定位受影响 Bean。</li>
+ *             <li>去抖 → 销毁旧 Bean（新实例惰性创建时自动读新值）。</li>
  *         </ul>
  *     </li>
+ *     <li>兼容路径：监听 {@link RefreshScopeRefreshedEvent}（SC 2021.0.x LegacyContextRefresher
+ *         全量 restart 场景），全量刷新所有 @RefreshOnKeys Bean。</li>
  * </ol>
  *
- * <h3>关键修复点</h3>
+ * <h2>版本适配</h2>
  * <ul>
- *     <li>注册监听器前先获取初始配置快照，避免首次推送触发所有 Bean 全量刷新。</li>
- *     <li>使用反向索引 O(1) 定位受影响 Bean，无需遍历所有元数据。</li>
- *     <li>每个 Bean 使用独立的 {@link ReentrantLock} 保证并发安全。</li>
- *     <li>去抖器抑制短时间内的重复刷新。</li>
+ *     <li><strong>SC 2022.0.x+</strong>（SB 3.x）：{@code EnvironmentChangeEvent} 携带正确 changedKeys，
+ *         精确条件刷新。</li>
+ *     <li><strong>SC 2021.0.x</strong>（SB 2.7）：{@code LegacyContextRefresher} 全量 restart 后
+ *         {@code EnvironmentChangeEvent} keys 为空，降级为 {@code RefreshScopeRefreshedEvent}
+ *         全量刷新所有 @RefreshOnKeys Bean。</li>
  * </ul>
  *
- * <h3>触发链路</h3>
- * <pre>
- * Nacos 推送 → receiveConfigInfo()
- *   → ConfigDiffUtils.parse() → 新快照
- *   → ConfigDiffUtils.diff(old, new) → 变更 keys
- *   → ListenerContext.findAffectedBeans() → 受影响 Bean 集合
- *   → Debouncer.debounce() + ReentrantLock → ConditionalRefreshScope.refresh()
- * </pre>
+ * <h2>监听器顺序</h2>
+ * <p>实现 {@link Ordered} 返回 {@link Ordered#LOWEST_PRECEDENCE}，确保在
+ * {@code ConfigurationPropertiesRebinder}（rebind @ConfigurationProperties）<strong>之后</strong>执行。
+ * 这样新 Bean 重建时能读到已 rebind 的 @ConfigurationProperties 值。
+ *
+ * <h2>与旧实现的区别</h2>
+ * <ul>
+ *     <li>旧实现：直接注册 Nacos SDK 监听器（{@code configService.addListener}），
+ *         在 PropertySource 更新<strong>之前</strong>触发 → 时序倒置 bug。</li>
+ *     <li>新实现：监听 Spring {@code EnvironmentChangeEvent}，在 PropertySource 更新<strong>之后</strong>触发
+ *         → 新 Bean 读到正确的新值。</li>
+ * </ul>
  *
  * @author conditional-refresh
  * @since 1.0.0
  */
 public class ConditionalRefreshListener
-        implements ApplicationListener<ApplicationReadyEvent>, AutoCloseable {
+        implements SmartApplicationListener, Ordered, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(ConditionalRefreshListener.class);
-
-    /** Nacos 配置管理器。 */
-    private final NacosConfigManager nacosConfigManager;
 
     /** 条件刷新作用域。 */
     private final ConditionalRefreshScope scope;
@@ -73,54 +77,81 @@ public class ConditionalRefreshListener
     private final Environment environment;
 
     /**
-     * 所有监听器上下文，按 (dataId, group) 索引。
-     * <p>结构：{@code dataId → group → ListenerContext}
-     */
-    private final Map<String, Map<String, ListenerContext>> contexts = new ConcurrentHashMap<>();
-
-    /**
      * Bean 级锁映射，保证同一 Bean 同一时刻只有一个刷新操作。
      * <p>使用 {@link ConcurrentHashMap#computeIfAbsent} 保证懒创建和线程安全。
      */
     private final ConcurrentHashMap<String, ReentrantLock> beanLocks = new ConcurrentHashMap<>();
 
+    /** 单一去抖器（不再需要 per-(dataId, group) 隔离）。 */
+    private final Debouncer debouncer = new Debouncer();
+
     /**
-     * 配置服务超时时间（ms）。
+     * 标记本轮刷新周期内 {@code EnvironmentChangeEvent} 是否已携带有效 keys。
+     * <p>SC 2022.0.x+ 下，同一次配置推送会顺序发布 {@code EnvironmentChangeEvent}
+     * 和 {@code RefreshScopeRefreshedEvent}。当主路径已处理时，跳过 fallback 全量刷新，
+     * 避免重复刷新。
      */
-    private static final long CONFIG_GET_TIMEOUT = 5000L;
+    private volatile boolean environmentChangeEventHandled = false;
 
     /**
      * 构造监听器。
      *
-     * @param nacosConfigManager Nacos 配置管理器
-     * @param scope              条件刷新作用域
-     * @param postProcessor      元数据后处理器
-     * @param environment        Spring 环境
+     * @param scope        条件刷新作用域
+     * @param postProcessor 元数据后处理器
+     * @param environment  Spring 环境
      */
-    public ConditionalRefreshListener(NacosConfigManager nacosConfigManager,
-                                     ConditionalRefreshScope scope,
-                                     RefreshOnKeysPostProcessor postProcessor,
-                                     Environment environment) {
-        this.nacosConfigManager = nacosConfigManager;
+    public ConditionalRefreshListener(ConditionalRefreshScope scope,
+                                      RefreshOnKeysPostProcessor postProcessor,
+                                      Environment environment) {
         this.scope = scope;
         this.postProcessor = postProcessor;
         this.environment = environment;
     }
 
     /**
-     * 应用就绪事件回调：注册所有 Nacos 配置监听器。
+     * 判断是否支持指定事件类型。
      *
-     * <p>在以下条件满足后执行：
+     * <p>支持三种事件：
      * <ul>
-     *     <li>Spring 容器启动完成。</li>
-     *     <li>Environment 完全就绪（可解析占位符）。</li>
-     *     <li>Nacos 配置服务可用。</li>
+     *   <li>{@link ApplicationReadyEvent} — 应用就绪，构建反向索引</li>
+     *   <li>{@link EnvironmentChangeEvent} — 环境变更（主路径）</li>
+     *   <li>{@link RefreshScopeRefreshedEvent} — RefreshScope 刷新完成（SC 2021.0.x fallback）</li>
      * </ul>
+     *
+     * @param eventType 事件类型
+     * @return 若支持返回 {@code true}
+     */
+    @Override
+    public boolean supportsEventType(Class<? extends ApplicationEvent> eventType) {
+        return ApplicationReadyEvent.class.isAssignableFrom(eventType)
+                || EnvironmentChangeEvent.class.isAssignableFrom(eventType)
+                || RefreshScopeRefreshedEvent.class.isAssignableFrom(eventType);
+    }
+
+    /**
+     * 统一事件分发。
+     *
+     * @param event 应用事件
+     */
+    @Override
+    public void onApplicationEvent(ApplicationEvent event) {
+        if (event instanceof ApplicationReadyEvent) {
+            onApplicationReady((ApplicationReadyEvent) event);
+        } else if (event instanceof EnvironmentChangeEvent) {
+            onEnvironmentChanged((EnvironmentChangeEvent) event);
+        } else if (event instanceof RefreshScopeRefreshedEvent) {
+            onRefreshScopeRefreshed((RefreshScopeRefreshedEvent) event);
+        }
+    }
+
+    /**
+     * 应用就绪事件回调：构建反向索引。
+     *
+     * <p>不再注册 Nacos SDK 监听器 — 改为监听 Spring 的 {@code EnvironmentChangeEvent}。
      *
      * @param event 应用就绪事件
      */
-    @Override
-    public void onApplicationEvent(ApplicationReadyEvent event) {
+    public void onApplicationReady(ApplicationReadyEvent event) {
         // 全局开关检查
         if (!isEnabled()) {
             log.info("Conditional refresh is disabled (conditional.refresh.enabled=false).");
@@ -134,165 +165,38 @@ public class ConditionalRefreshListener
         }
 
         // 构建最终的反向索引（解析占位符、空 dataId 回退等）
-        Map<String, Map<String, MetadataCollector.IndexEntry>> index =
-                collector.buildCommittedIndex(environment);
+        collector.buildCommittedIndex(environment);
 
-        log.info("Building conditional refresh listeners for {} dataId(s)", index.size());
-
-        for (Map.Entry<String, Map<String, MetadataCollector.IndexEntry>> dataEntry : index.entrySet()) {
-            String dataId = dataEntry.getKey();
-            for (Map.Entry<String, MetadataCollector.IndexEntry> groupEntry : dataEntry.getValue().entrySet()) {
-                String group = groupEntry.getKey();
-                MetadataCollector.IndexEntry entry = groupEntry.getValue();
-                registerListener(dataId, group, entry);
-            }
-        }
-
-        log.info("Conditional refresh listeners registered successfully. " +
-                "Total contexts: {}", contexts.size());
+        log.info("Conditional refresh listeners initialized. " +
+                "Listening on EnvironmentChangeEvent for key changes.");
     }
 
     /**
-     * 释放所有资源（应用关闭时调用）。
+     * 处理 {@link EnvironmentChangeEvent}（主路径 — SC 2022.0.x+）。
      *
-     * <p>关闭所有 {@link ListenerContext} 内部的 {@link Debouncer} 线程池，
-     * 清空上下文和锁映射。实现 {@link AutoCloseable} 以支持 {@code try-with-resources}。
+     * <p>在 PropertySource 更新后、ConfigurationPropertiesRebinder rebind 后调用。
+     * 通过反向索引精准定位受影响 Bean。
+     *
+     * @param event 环境变更事件
      */
-    @Override
-    public void close() {
-        log.debug("Closing ConditionalRefreshListener, {} context(s) to release.", contexts.size());
-        for (Map<String, ListenerContext> groupMap : contexts.values()) {
-            for (ListenerContext ctx : groupMap.values()) {
-                ctx.close();
-            }
-        }
-        contexts.clear();
-        beanLocks.clear();
-    }
-
-    // ─── 私有方法 ─────────────────────────────────────────────────────
-
-    /**
-     * 为指定的 (dataId, group) 注册 Nacos 监听器。
-     *
-     * <p><strong>关键</strong>：注册前先主动获取一次当前配置作为初始快照，
-     * 避免首次推送被误判为"所有 key 都新增"从而导致无谓的全量刷新。
-     *
-     * <p><strong>file-extension 处理</strong>：Spring Cloud Alibaba 的 Nacos 客户端
-     * 在 {@code file-extension} 非空时，实际存储的 dataId 为 {@code dataId.fileExtension}
-     * （例如 dataId=app + file-extension=yaml → 实际 dataId=app.yaml）。
-     * 为确保条件刷新监听器能接收到 Nacos 推送，本方法会同时注册原始 dataId 和
-     * 带扩展名的 dataId 两个监听器（如果扩展名非空且 dataId 尚未以扩展名结尾）。
-     *
-     * @param dataId Nacos Data ID
-     * @param group  Nacos Group
-     * @param entry  该组的反向索引条目
-     */
-    private void registerListener(String dataId, String group,
-                                  MetadataCollector.IndexEntry entry) {
-        // 1. 获取初始配置快照（避免首次推送的全量刷新）
-        Map<String, Object> initialSnapshot = fetchInitialSnapshot(dataId, group);
-
-        // 2. 创建监听器上下文
-        ListenerContext ctx = new ListenerContext(entry, initialSnapshot);
-        contexts.computeIfAbsent(dataId, k -> new ConcurrentHashMap<>()).put(group, ctx);
-
-        // 3. 注册 Nacos 监听器（原始 dataId）
-        addNacosListener(dataId, group);
-
-        // 4. 如果 file-extension 非空且 dataId 尚未以扩展名结尾，额外注册带扩展名的 dataId
-        String fileExtension = environment.getProperty("spring.cloud.nacos.config.file-extension");
-        if (fileExtension != null && !fileExtension.isEmpty()
-                && !dataId.endsWith("." + fileExtension)) {
-            String dataIdWithExt = dataId + "." + fileExtension;
-            addNacosListener(dataIdWithExt, group);
-        }
-    }
-
-    /**
-     * 向 Nacos 注册单个监听器。
-     *
-     * @param dataId Nacos Data ID
-     * @param group  Nacos Group
-     */
-    private void addNacosListener(String dataId, String group) {
-        try {
-            nacosConfigManager.getConfigService().addListener(dataId, group, new Listener() {
-                @Override
-                public Executor getExecutor() {
-                    // 在 Nacos 线程池中执行，不占用业务线程
-                    return null;
-                }
-
-                @Override
-                public void receiveConfigInfo(String configInfo) {
-                    handleChange(dataId, group, configInfo);
-                }
-            });
-
-            log.info("Registered Nacos listener for dataId={}, group={}", dataId, group);
-        } catch (NacosException e) {
-            log.error("Failed to register Nacos listener for dataId={}, group={}: {}",
-                    dataId, group, e.getMessage(), e);
-        }
-    }
-
-    /**
-     * 主动获取当前配置内容作为初始快照。
-     *
-     * <p>若获取失败（Nacos 未启动、网络问题等），则使用空快照作为兜底，
-     * 此时首次推送会触发全量刷新（但仍是安全的，可恢复）。
-     *
-     * @param dataId Nacos Data ID
-     * @param group  Nacos Group
-     * @return 当前配置的快照 Map
-     */
-    private Map<String, Object> fetchInitialSnapshot(String dataId, String group) {
-        try {
-            String config = nacosConfigManager.getConfigService()
-                    .getConfig(dataId, group, CONFIG_GET_TIMEOUT);
-            if (config != null && !config.isEmpty()) {
-                log.debug("Initial snapshot fetched for dataId={}, group={}", dataId, group);
-                return ConfigDiffUtils.parse(config);
-            }
-        } catch (NacosException e) {
-            log.warn("Failed to fetch initial snapshot for dataId={}, group={}: {}",
-                    dataId, group, e.getMessage());
-        }
-        return Collections.emptyMap();
-    }
-
-    /**
-     * 处理配置变更回调：解析 → diff → 反向索引 → 去抖刷新。
-     *
-     * @param dataId       Nacos Data ID
-     * @param group        Nacos Group
-     * @param newConfigText 新配置的全文
-     */
-    private void handleChange(String dataId, String group, String newConfigText) {
-        ListenerContext ctx = getContext(dataId, group);
-        if (ctx == null) {
-            log.warn("No listener context found for dataId={}, group={}", dataId, group);
+    public void onEnvironmentChanged(EnvironmentChangeEvent event) {
+        if (!isEnabled()) {
             return;
         }
 
-        // 1. 解析新配置
-        Map<String, Object> newSnapshot = ConfigDiffUtils.parse(newConfigText);
-
-        // 2. 原子替换快照，并返回替换前的旧快照用于 diff
-        Map<String, Object> oldSnapshot = ctx.replaceSnapshotAndGetOld(newSnapshot);
-
-        // 3. 计算真正变化的 keys
-        Set<String> changedKeys = ConfigDiffUtils.diff(oldSnapshot, newSnapshot);
-        if (changedKeys.isEmpty()) {
-            log.debug("No effective key changes for dataId={}, group={}", dataId, group);
+        Set<String> changedKeys = event.getKeys();
+        if (changedKeys == null || changedKeys.isEmpty()) {
+            log.debug("EnvironmentChangeEvent with empty keys, skip.");
             return;
         }
 
-        log.info("Config changed for dataId={}, group={}: {}", dataId, group, changedKeys);
+        log.info("Environment changed, keys: {}", changedKeys);
 
-        // 4. 通过反向索引查找受影响的 Bean
-        Set<String> affectedBeans = ctx.findAffectedBeans(changedKeys);
+        // 标记主路径已处理，抑制本轮 fallback
+        environmentChangeEventHandled = true;
+
+        // 通过反向索引查找受影响的 Bean
+        Set<String> affectedBeans = findAffectedBeans(changedKeys);
         if (affectedBeans.isEmpty()) {
             log.debug("Changed keys {} not watched by any bean", changedKeys);
             return;
@@ -300,11 +204,107 @@ public class ConditionalRefreshListener
 
         log.info("Affected beans for changed keys {}: {}", changedKeys, affectedBeans);
 
-        // 5. 对每个受影响的 Bean 执行去抖刷新
-        Debouncer debouncer = ctx.getDebouncer();
+        // 对每个受影响的 Bean 执行去抖刷新
         for (String beanName : affectedBeans) {
             debouncer.debounce(beanName, () -> refreshBean(beanName));
         }
+    }
+
+    /**
+     * 处理 {@link RefreshScopeRefreshedEvent}（兼容路径 — SC 2021.0.x fallback）。
+     *
+     * <p>SC 2021.0.x 的 LegacyContextRefresher 全量 restart 后，EnvironmentChangeEvent
+     * 不携带有效 keys。此事件在 RefreshScope.refreshAll() 完成后发布，作为 fallback 触发器。
+     *
+     * <p>由于无法获取具体 changedKeys，全量刷新所有 @RefreshOnKeys Bean。
+     *
+     * @param event RefreshScope 刷新完成事件
+     */
+    public void onRefreshScopeRefreshed(RefreshScopeRefreshedEvent event) {
+        if (!isEnabled()) {
+            return;
+        }
+
+        // SC 2022.0.x+ 下 EnvironmentChangeEvent 已携带 keys 并处理完毕，
+        // 跳过 fallback 避免重复刷新。
+        if (environmentChangeEventHandled) {
+            environmentChangeEventHandled = false;
+            return;
+        }
+
+        MetadataCollector collector = postProcessor.getCollector();
+        if (collector.isEmpty()) {
+            return;
+        }
+
+        // committedIndex 尚未构建（首次启动时 RefreshScopeRefreshedEvent 可能在 ApplicationReadyEvent 之前）
+        if (collector.getCommittedIndex() == null) {
+            log.debug("Committed index not built yet, skip RefreshScopeRefreshedEvent.");
+            return;
+        }
+
+        log.info("RefreshScopeRefreshedEvent received (SC 2021.0.x fallback), " +
+                "refreshing all @RefreshOnKeys beans.");
+
+        Set<String> allBeans = collector.getAllBeanNames();
+        if (allBeans.isEmpty()) {
+            return;
+        }
+
+        for (String beanName : allBeans) {
+            debouncer.debounce(beanName, () -> refreshBean(beanName));
+        }
+    }
+
+    /**
+     * 释放所有资源（应用关闭时调用）。
+     *
+     * <p>关闭去抖器线程池，清空锁映射。
+     */
+    @Override
+    public void close() {
+        log.debug("Closing ConditionalRefreshListener, releasing debouncer and locks.");
+        debouncer.close();
+        beanLocks.clear();
+    }
+
+    /**
+     * 返回监听器执行顺序。
+     *
+     * <p>返回 {@link Ordered#LOWEST_PRECEDENCE}，确保在 {@code ConfigurationPropertiesRebinder}
+     * （rebind @ConfigurationProperties）<strong>之后</strong>执行。
+     *
+     * @return 排序值（越大越晚执行）
+     */
+    @Override
+    public int getOrder() {
+        return Ordered.LOWEST_PRECEDENCE;
+    }
+
+    // ─── 私有方法 ─────────────────────────────────────────────────────
+
+    /**
+     * 通过反向索引查找受影响的 Bean 名称（精确 + 前缀匹配）。
+     *
+     * @param changedKeys 变更的配置键集合
+     * @return 受影响的 Bean 名称集合（去重）；若 committedIndex 尚未构建返回空集
+     */
+    private Set<String> findAffectedBeans(Set<String> changedKeys) {
+        MetadataCollector collector = postProcessor.getCollector();
+        Set<String> affected = new HashSet<>();
+        if (collector.isEmpty()) {
+            return affected;
+        }
+        Map<String, Map<String, MetadataCollector.IndexEntry>> index = collector.getCommittedIndex();
+        if (index == null) {
+            return affected;
+        }
+        for (Map<String, MetadataCollector.IndexEntry> groupMap : index.values()) {
+            for (MetadataCollector.IndexEntry entry : groupMap.values()) {
+                affected.addAll(entry.findAffectedBeans(changedKeys));
+            }
+        }
+        return affected;
     }
 
     /**
@@ -315,8 +315,6 @@ public class ConditionalRefreshListener
      *
      * <p><strong>注意</strong>：{@link ConditionalRefreshScope#refresh(String)}
      * 仅销毁旧实例，新实例将在下次通过 scoped-proxy 访问时惰性创建。
-     * 此处记录的 {@code conditional.refresh.success} 指标表示"旧实例已销毁"，
-     * 不代表新实例已成功创建。新实例创建失败将在后续访问时通过异常暴露。
      *
      * @param beanName Bean 名称
      */
@@ -325,14 +323,15 @@ public class ConditionalRefreshListener
         lock.lock();
         try {
             log.info("Refreshing bean '{}' ...", beanName);
-            boolean destroyed = scope.refresh(beanName);
-            if (destroyed) {
-                // 旧实例已销毁，新实例将在下次 proxy 访问时惰性创建
-                log.info("Bean '{}' destroyed. New instance will be created lazily on next access.",
+            boolean effective = scope.refresh(beanName);
+            if (effective) {
+                log.info("Bean '{}' config change applied. New instance will be created lazily on next access.",
                         beanName);
                 recordSuccess(beanName);
             } else {
-                log.warn("Bean '{}' not found in conditional refresh scope.", beanName);
+                log.warn("Bean '{}' refresh returned false (unexpected, possible destroyMethod failure).",
+                        beanName);
+                recordFailure(beanName);
             }
         } catch (Exception e) {
             log.error("Failed to refresh bean '{}': {}", beanName, e.getMessage(), e);
@@ -340,36 +339,6 @@ public class ConditionalRefreshListener
         } finally {
             lock.unlock();
         }
-    }
-
-    /**
-     * 获取指定 (dataId, group) 的监听器上下文。
-     *
-     * <p>自动兼容带 file-extension 后缀的 dataId：如果直接查询不到，
-     * 尝试去掉 {@code .fileExtension} 后缀后重试（Spring Cloud Alibaba 实际存储的
-     * dataId 可能为 {@code dataId.yaml}）。
-     *
-     * @param dataId Nacos Data ID
-     * @param group  Nacos Group
-     * @return 对应的 {@link ListenerContext}，若不存在返回 {@code null}
-     */
-    private ListenerContext getContext(String dataId, String group) {
-        Map<String, ListenerContext> groupMap = contexts.get(dataId);
-        if (groupMap != null) {
-            ListenerContext ctx = groupMap.get(group);
-            if (ctx != null) return ctx;
-        }
-        // 尝试去掉 file-extension 后缀后重试
-        String fileExtension = environment.getProperty("spring.cloud.nacos.config.file-extension");
-        if (fileExtension != null && !fileExtension.isEmpty()
-                && dataId.endsWith("." + fileExtension)) {
-            String baseDataId = dataId.substring(0, dataId.length() - fileExtension.length() - 1);
-            Map<String, ListenerContext> baseGroupMap = contexts.get(baseDataId);
-            if (baseGroupMap != null) {
-                return baseGroupMap.get(group);
-            }
-        }
-        return null;
     }
 
     /**

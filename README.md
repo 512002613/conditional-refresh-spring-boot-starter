@@ -7,10 +7,12 @@
 - 🎯 **精确到 Key 级别**：结构化 diff，只刷新真正受影响的 Bean。
 - 🔌 **无侵入注解**：`@RefreshOnKeys` 不包含 `@Scope` 语义，作用域自动设置。
 - 🔄 **与全局 @RefreshScope 共存**：两种刷新策略互不干扰。
-- ⚡ **首次推送不刷新**：注册 Nacos 监听器前主动获取初始快照。
+- 🎛️ **双模式监听**：精确模式（显式列 key）+ 前缀模式（`prefix.*` 粗粒监听）。
+- ⏱️ **PropertySource-First 时序**：监听 Spring `EnvironmentChangeEvent`，确保新实例读到正确的新值。
 - 🛡️ **并发安全**：Bean 级锁 + 去抖，防止重复刷新。
 - 📊 **Micrometer 监控指标**：`conditional.refresh.success` / `failure`。
 - 🔌 **可选 Nacos 依赖**：仅当 Nacos Config 在 classpath 时启用。
+- 🌐 **多版本兼容**：Spring Boot 2.7 / 3.0 / 3.5 / 4.0 全矩阵验证。
 
 ## 快速开始
 
@@ -69,15 +71,6 @@ conditional:
     initial-snapshot-enabled: true  # 首次注册拉取快照
 ```
 
-## Nacos file-extension 兼容
-
-当 Nacos 配置 `file-extension: yaml`（或 `properties`）时，Nacos 2.x 服务端实际存储和推送的 dataId 会自动追加扩展名后缀（例如 `myapp` → `myapp.yaml`）。框架已内置兼容处理：
-
-- 注册 Nacos 监听器时，自动同时注册 `dataId` 与 `dataId.fileExtension` 两个监听器
-- 接收推送时，无论 Nacos 回调返回哪个 dataId 形式，均能正确找到对应的 `ListenerContext`
-
-**无需额外配置**，框架自动从 `spring.cloud.nacos.config.file-extension` 感知当前后缀。
-
 ## 行为说明
 
 | 触发场景 | SmsService | cosClient |
@@ -89,39 +82,36 @@ conditional:
 
 ## 测试验证模块
 
-项目内置 `conditional-refresh-test-sample` 模块，无需外部项目即可验证框架功能：
+项目内置多个测试验证模块，覆盖 Spring Boot 2.7 / 3.0 / 3.5 / 4.0：
+
+| 模块 | Spring Boot | Spring Cloud | 说明 |
+|------|-------------|--------------|------|
+| `conditional-refresh-test-sample` | 2.7.18 | 2021.0.8 | 与父 POM 一起构建 |
+| `conditional-refresh-test-sample-v2` | 2.7.18 | 2022.0.5 | 独立项目 |
+| `conditional-refresh-test-sample-v3` | 3.5.x | 2023.0.x | 独立项目，需 Java 17 |
+| `conditional-refresh-test-sample-v4` | 4.0.x | 2023.0.x | 独立项目，需 Java 17 |
 
 ```bash
-# 构建整个项目
-mvn clean package -DskipTests
+# 构建 v2 测试模块（独立项目）
+mvn clean package -pl conditional-refresh-test-sample-v2
 
 # 运行测试验证应用
-java -jar conditional-refresh-test-sample/target/conditional-refresh-test-sample-1.0.0.jar
+java -jar conditional-refresh-test-sample-v2/target/conditional-refresh-test-sample-v2-1.0.0.jar
 ```
 
 启动后通过 REST 端点验证：
 
 ```bash
 # 查看当前 Bean 值
-curl http://localhost:8080/test/channel-sign
-curl http://localhost:8080/test/template
-curl http://localhost:8080/test/feature
+curl http://localhost:65380/v2/status
 
 # 健康检查
-curl http://localhost:8080/test/health
+curl http://localhost:65380/v2/health
 ```
 
-**切换 Nacos 环境**：只需修改 `conditional-refresh-test-sample/pom.xml` 中的三个属性：
+**切换 Nacos 环境**：修改对应模块 `pom.xml` 中的 `<nacos.server-addr>`、`<nacos.namespace>`、`<nacos.group>` 三个属性即可。
 
-```xml
-<nacos.server-addr>你的Nacos地址:8848</nacos.server-addr>
-<nacos.namespace>你的namespace</nacos.namespace>
-<nacos.group>你的group</nacos.group>
-```
-
-重新构建即可，无需修改任何 YAML 配置文件。
-
-> **注意**：集成测试（`ConditionalRefreshSampleTest`）需要连接真实 Nacos 服务器。结构与下游 `tornado-facade-service` 的 E2E 测试一致。
+> **注意**：集成测试需要连接真实 Nacos 服务器。v3/v4 模块构建需 Maven 镜像含 Spring Cloud Alibaba 2023.x BOM。
 
 ## 设计架构
 
@@ -130,41 +120,43 @@ curl http://localhost:8080/test/health
      │
      ▼
 RefreshOnKeysPostProcessor (BDRPP)
-     │  ① 扫描注解元数据
-     │  ② 设置 scope="conditionalRefresh"
-     │  ③ 设置 proxyMode=TARGET_CLASS
+     │  ① 扫描注解元数据（value 或 prefix 模式）
+     │  ② 设置 scope="conditionalRefresh" + CGLIB scoped-proxy
+     │  ③ 互斥校验（不得同时标注 @RefreshScope）
      │  ④ 收集元数据到 MetadataCollector
      ▼
-ConditionalRefreshListener (on ApplicationReadyEvent)
-     │  ① 构建反向索引 (key → Set<beanName>)
-     │  ② 为每个 (dataId, group) 获取初始快照
-     │  ③ 注册 Nacos Listener
-     ▼
-Nacos 配置推送
+Bean 实例化 → scoped-proxy 代理（惰性，首次访问时创建目标实例）
      │
      ▼
-ConfigDiffUtils.parse() → 新快照
-ConfigDiffUtils.diff(old, new) → 变更 keys
-ListenerContext.findAffectedBeans() → 受影响 Beans
+ApplicationReadyEvent
+     │  ConditionalRefreshListener.onApplicationReady()
+     │  ① 构建双索引 (key → beans / prefix → beans)
+     ▼
+Nacos 配置推送 → PropertySource 更新 → EnvironmentChangeEvent
      │
      ▼
-Debouncer + ReentrantLock
-     │
+ConditionalRefreshListener.onEnvironmentChanged()  ← 主路径
+     │  ① event.getKeys() 获取变更 keys
+     │  ② 双索引查找受影响 Bean（精确 + 前缀）
+     │  ③ Debouncer 去抖 → ReentrantLock → scope.refresh()
      ▼
-ConditionalRefreshScope.refresh(beanName)
-     │  ① super.remove() → destroyMethod
-     │  ② super.get() → 重建并缓存
-     ▼
-完成
+旧实例销毁（destroyMethod）→ 下次 proxy 访问时惰性创建新实例（读到的新值）
+
+┌─────────────────────────────────────────────────────────────────────┐
+│ SC 2021.0.x fallback:                                               │
+│ RefreshScopeRefreshedEvent → 全量刷新所有 @RefreshOnKeys Bean       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 关键约束
 
 - ❌ `@RefreshOnKeys` 与 `@RefreshScope` **不能同时标记**同一 Bean（启动时报错）。
+- ❌ `@RefreshOnKeys` 的 `value` 与 `prefix` **不能同时非空，也不能同时为空**。
 - ✅ 支持 `${...}` 占位符（在环境就绪后统一解析）。
 - ✅ 空 `dataId` 自动回退为 `spring.cloud.nacos.config.prefix` → `spring.application.name`。
 - ✅ 空 `group` 自动回退为 `spring.cloud.nacos.config.group` → `DEFAULT_GROUP`。
-- ✅ 支持 properties 和 YAML 格式配置。
+- ✅ 支持 properties 和 YAML 格式配置（Nacos 存储格式无关）。
+- ✅ 监听器顺序 `Ordered.LOWEST_PRECEDENCE`，确保在 `ConfigurationPropertiesRebinder` 之后执行。
 
 ## 监控指标
 
@@ -172,6 +164,15 @@ ConditionalRefreshScope.refresh(beanName)
 |-------|------|-----|
 | `conditional.refresh.success` | Counter | 刷新成功次数（标签：`bean` = Bean 名） |
 | `conditional.refresh.failure` | Counter | 刷新失败次数（标签：`bean` = Bean 名） |
+
+## 两种监听模式对比
+
+| 维度 | 精确模式 (`value`) | 前缀模式 (`prefix`) |
+|-----|-------------------|-------------------|
+| 用法 | `@RefreshOnKeys({"a.b.c"})` | `@RefreshOnKeys(prefix = "a.b")` |
+| 触发条件 | 仅列出的 key 值变更 | 任何 `a.b.*` key 变更 |
+| 适用场景 | 少量 key、精确控制 | 整个 `@ConfigurationProperties` 绑定 |
+| 推荐注入方式 | `@Value` | 构造函数注入 Properties Bean |
 
 ## 条件刷新 vs 全量刷新对比
 
@@ -182,6 +183,14 @@ ConditionalRefreshScope.refresh(beanName)
 | 作用域 | `refresh` | `conditionalRefresh` |
 | Key 匹配 | N/A | 结构化 diff |
 | 性能 | O(n) 全量重建 | O(k) 精准重建（k << n）|
+
+## 文档
+
+| 文档 | 说明 |
+|------|------|
+| [`docs/code-reading-guide.md`](docs/code-reading-guide.md) | **框架原理与代码解读**（面向初学者，由浅入深讲解设计动机、核心原理和代码实现） |
+| [`CHANGELOG.md`](CHANGELOG.md) | 变更日志 |
+| [`CLAUDE.md`](CLAUDE.md) | 项目架构与构建指引（面向开发者） |
 
 ## 许可证
 

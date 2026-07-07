@@ -18,3 +18,6 @@ Thumbs.db
 # Temp
 tmp-*.xml
 *.log
+
+# Claude session history (local-only, not in VCS)
+.claude-session-history.md

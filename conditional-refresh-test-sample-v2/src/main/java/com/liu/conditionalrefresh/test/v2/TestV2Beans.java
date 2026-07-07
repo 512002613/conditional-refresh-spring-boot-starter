@@ -1,7 +1,5 @@
-package com.liu.conditionalrefresh.test.v4;
+package com.liu.conditionalrefresh.test.v2;
 
-import com.alibaba.cloud.nacos.NacosConfigManager;
-import com.alibaba.nacos.api.config.ConfigService;
 import com.liu.conditionalrefresh.annotation.RefreshOnKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,7 +9,10 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * Spring Boot 4.0.x 测试验证模块的示例 Bean 配置。
+ * Spring Boot 2.7.x + Spring Cloud 2022.0.x 测试验证模块的示例 Bean 配置。
+ *
+ * <p>验证在 Spring Cloud 新一代轻量 RefreshEvent 机制下，条件刷新是否正常
+ * 工作 —— 配置变更时仅刷新关联 Bean，不触发全量 context restart。
  *
  * <p>演示两种 {@code @RefreshOnKeys} 用法：
  * <ul>
@@ -20,54 +21,51 @@ import org.springframework.context.annotation.Configuration;
  * </ul>
  */
 @Configuration
-@EnableConfigurationProperties({TestV4Beans.ChannelSignProperties.class,
-        TestV4Beans.TemplateProperties.class, TestV4Beans.FeatureProperties.class})
-public class TestV4Beans {
+@EnableConfigurationProperties({TestV2Beans.ChannelSignProperties.class,
+        TestV2Beans.TemplateProperties.class, TestV2Beans.FeatureProperties.class})
+public class TestV2Beans {
 
-    private static final Logger log = LoggerFactory.getLogger(TestV4Beans.class);
+    private static final Logger log = LoggerFactory.getLogger(TestV2Beans.class);
 
     /**
-     * 精确模式：监听 channel.sign.secret 和 channel.sign.token。
+     * 精确模式：监听 channel.sign.secret 和 channel.sign.token 两个明确的 key。
      */
     @Bean(destroyMethod = "destroy")
     @RefreshOnKeys({"channel.sign.secret", "channel.sign.token"})
     public ChannelSignService channelSignService(ChannelSignProperties props) {
-        log.info("[V4] ChannelSignService 初始化, secret={}, token={}",
+        log.info("[V2] ChannelSignService 初始化, secret={}, token={}",
                 props.getSecret(), props.getToken());
         return new ChannelSignService(props.getSecret(), props.getToken());
     }
 
     /**
-     * 前缀模式：监听所有以 "template." 开头的 key，注入整个 Properties Bean。
+     * 前缀模式：监听所有以 "template." 开头的 key。
+     *
+     * <p>通过注入 {@link TemplateProperties} 整个 Properties Bean，
+     * 当任何 {@code template.*} key 变更时，
+     * {@code ConfigurationPropertiesRebinder} 先 rebind Properties Bean，
+     * 然后条件刷新销毁旧 Service 实例，新实例惰性创建时读到最新值。
      */
     @Bean(destroyMethod = "destroy")
     @RefreshOnKeys(prefix = "template")
     public TemplateService templateService(TemplateProperties props) {
-        log.info("[V4] TemplateService 初始化, maxRetry={}, timeout={}",
+        log.info("[V2] TemplateService 初始化, maxRetry={}, timeout={}",
                 props.getMaxRetry(), props.getTimeout());
         return new TemplateService(props.getMaxRetry(), props.getTimeout());
     }
 
     /**
-     * 精确模式 + 显式 dataId/group。
+     * 精确模式 + 显式 dataId/group：监听 custom.feature.enabled。
      */
     @Bean(destroyMethod = "destroy")
     @RefreshOnKeys(
             value = {"custom.feature.enabled"},
-            dataId = "conditional-refresh-test-sample-v4",
+            dataId = "conditional-refresh-test-sample-v2",
             group = "DEFAULT_GROUP"
     )
     public FeatureToggleService featureToggleService(FeatureProperties props) {
-        log.info("[V4] FeatureToggleService 初始化, enabled={}", props.getEnabled());
+        log.info("[V2] FeatureToggleService 初始化, enabled={}", props.getEnabled());
         return new FeatureToggleService(props.getEnabled());
-    }
-
-    /**
-     * 暴露 {@link ConfigService} 供集成测试发布配置。
-     */
-    @Bean
-    public ConfigService configService(NacosConfigManager nacosConfigManager) {
-        return nacosConfigManager.getConfigService();
     }
 
     // ─── @ConfigurationProperties 绑定类 ─────────────────────────────
@@ -117,7 +115,7 @@ public class TestV4Beans {
         public String getToken() { return token; }
 
         public void destroy() {
-            log.info("[V4] ChannelSignService.destroy() 被调用");
+            log.info("[V2] ChannelSignService.destroy() 被调用");
         }
     }
 
@@ -134,7 +132,7 @@ public class TestV4Beans {
         public long getTimeout() { return timeout; }
 
         public void destroy() {
-            log.info("[V4] TemplateService.destroy() 被调用");
+            log.info("[V2] TemplateService.destroy() 被调用");
         }
     }
 
@@ -148,7 +146,7 @@ public class TestV4Beans {
         public boolean isEnabled() { return enabled; }
 
         public void destroy() {
-            log.info("[V4] FeatureToggleService.destroy() 被调用");
+            log.info("[V2] FeatureToggleService.destroy() 被调用");
         }
     }
 }

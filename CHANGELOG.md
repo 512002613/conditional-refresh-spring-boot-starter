@@ -2,7 +2,175 @@
 
 ## [Unreleased]
 
+### 破坏性变更
+
+#### 12. ConditionalRefreshListener 事件源从 Nacos SDK 切换为 Spring EnvironmentChangeEvent（P1）— 2026-07-07
+
+**背景**：原实现通过 Nacos SDK 原始监听器（`configService.addListener`）直接响应配置推送，导致 Bean 销毁/重建发生在 Spring `PropertySource` 更新**之前**（日志证据：Nacos 推送后 190ms 才完成 PropertySource 更新）。新实例惰性创建时读到 stale 值，条件刷新等于白做。
+
+**变更**：
+- `ConditionalRefreshListener` 从 `ApplicationListener<ApplicationReadyEvent>` 重构为 `SmartApplicationListener`，监听两个事件：
+  1. `EnvironmentChangeEvent`（主路径，SC 2022.0.x+）— 在 PropertySource 更新后发布，携带 `Set<String> changedKeys`
+  2. `RefreshScopeRefreshedEvent`（fallback，SC 2021.0.x）— `LegacyContextRefresher` 全量 restart 后触发，不携带 keys → 全量刷新所有 `@RefreshOnKeys` Bean
+- 移除 `NacosConfigManager` 依赖注入、`addNacosListener()`、`fetchInitialSnapshot()`、`contexts` 映射、snapshot 原子替换逻辑
+- 删除 `ListenerContext` 类（不再需要 per-(dataId,group) snapshot 管理）
+- 实现 `Ordered` 接口返回 `Ordered.LOWEST_PRECEDENCE`，确保在 `ConfigurationPropertiesRebinder` **之后**执行（保证 `@ConfigurationProperties` Bean 已 rebind 后，conditional Bean 才销毁重建）
+- `ConditionalRefreshAutoConfiguration.conditionalRefreshListener()` 签名移除 `NacosConfigManager` 参数
+
+**版本适配**：
+- SC 2022.0.x+（v2/v3/v4 模块）：精确模式 + 前缀模式均正常工作
+- SC 2021.0.x（test-sample 模块）：降级为 fallback 全量刷新（`LegacyContextRefresher` 全量 restart 的固有局限）
+
+**测试结果**：
+```
+Tests run: 66, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
+
 ### 新增
+
+#### 11. @RefreshOnKeys 新增 prefix() 前缀监听模式（P1）— 2026-07-07
+
+**背景**：用户期望支持"自动监听"模式 — 无需显式列出每个 key，而是通过前缀匹配实现粗粒监听。典型场景：`@ConfigurationProperties(prefix = "channel.sign")` 绑定的 Bean，当任何 `channel.sign.*` key 变更时自动触发刷新。
+
+**变更**：
+- `@RefreshOnKeys` 新增 `String prefix() default ""` 属性
+- `value()` 与 `prefix()` 互斥校验（在 `RefreshOnKeysPostProcessor` 启动时验证）：
+  - 两者都非空 → 启动异常
+  - 两者都为空 → 启动异常
+- `MetadataCollector.IndexEntry` 新增 `prefixToBeanNames: Map<String, Set<String>>` 双索引
+- `findAffectedBeans()` 同时遍历精确索引和前缀索引，前缀匹配规则：`changedKey.startsWith(prefix + ".")`
+- 支持 `@ConfigurationProperties` Bean 注入工厂方法参数（prefix 模式下推荐做法）
+
+**使用示例**：
+```java
+@ConfigurationProperties(prefix = "channel.sign")
+public class ChannelSignProperties { private String secret; private String token; }
+
+@Bean(destroyMethod = "destroy")
+@RefreshOnKeys(prefix = "channel.sign")
+public ChannelSignService channelSignService(ChannelSignProperties props) {
+    return new ChannelSignService(props.getSecret(), props.getToken());
+}
+```
+
+**测试结果**：
+```
+Tests run: 66, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
+
+### 文件变更清单
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `conditional-refresh-spring-boot-starter/src/main/java/.../annotation/RefreshOnKeys.java` | 修改 | 新增 `prefix()` 属性，`value()` 改为 `default {}` |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../processor/MetadataCollector.java` | 修改 | `add()` 新增 prefix 参数；`IndexEntry` 新增 `prefixToBeanNames` 双索引；`findAffectedBeans()` 支持前缀匹配 |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../processor/RefreshOnKeysPostProcessor.java` | 修改 | 提取 prefix；新增 value/prefix 互斥校验 |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../listener/ConditionalRefreshListener.java` | 重构 | 从 Nacos SDK 监听改为 SmartApplicationListener 双事件监听（EnvironmentChangeEvent + RefreshScopeRefreshedEvent）；移除 NacosConfigManager 依赖；实现 Ordered |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../config/ConditionalRefreshAutoConfiguration.java` | 修改 | `conditionalRefreshListener()` 签名移除 NacosConfigManager 参数 |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../listener/ListenerContext.java` | 删除 | 不再需要 per-(dataId,group) snapshot 管理 |
+| `conditional-refresh-spring-boot-starter/src/test/java/.../ConditionalRefreshListenerTest.java` | 重构 | 移除 Nacos mock；改为 EnvironmentChangeEvent + RefreshScopeRefreshedEvent 测试 |
+| `conditional-refresh-spring-boot-starter/src/test/java/.../ListenerContextTest.java` | 删除 | 跟随 ListenerContext |
+| `conditional-refresh-spring-boot-starter/src/test/java/.../ConditionalRefreshListenerRefreshEventTest.java` | 新增 | 双模式覆盖测试（精确 + 前缀 + 混合 + fallback） |
+| `conditional-refresh-spring-boot-starter/src/test/java/.../MetadataCollectorTest.java` | 修改 | 新增 prefix 模式测试 |
+| `conditional-refresh-test-sample-v2/src/main/java/.../TestV2Beans.java` | 修改 | 抽取 @ConfigurationProperties 类；TemplateService 改为 prefix 模式 |
+| `conditional-refresh-test-sample-v3/src/main/java/.../TestV3Beans.java` | 修改 | 同上 |
+| `conditional-refresh-test-sample-v4/src/main/java/.../TestV4Beans.java` | 修改 | 同上 |
+
+### 修复
+
+#### 8. RefreshOnKeysPostProcessor proxyMode 设置方式错误导致 scoped-proxy 未创建（P0）— 2026-07-07
+
+`RefreshOnKeysPostProcessor.rewriteBeanDefinition()` 在 Spring Framework 5.x（starter 编译目标）上无法正确设置 `ScopedProxyMode.TARGET_CLASS`。原代码通过反射设置 `proxyMode` 字段：
+- Spring 5.3.x 的 `AbstractBeanDefinition` 没有 `proxyMode` 字段 → 反射抛 `NoSuchFieldException`
+- 回退到 `BeanDefinition.setAttribute("ScopedProxyUtils.proxyMode", TARGET_CLASS)` — 但 Spring 的 `ScopedProxyCreator` 不读取这个 attribute key 来创建代理
+
+**现象**（v2 模块 SB3.0 + SC 2022.0.x 端到端验证）：
+```
+c.l.c.p.RefreshOnKeysPostProcessor : Bean 'channelSignService' scope='conditionalRefresh', proxyMode set via attribute fallback.
+```
+Bean 被创建为普通单例（非 scoped-proxy），注入 Controller 的是原始实例而非代理。配置变更时：
+- `scope.refresh("channelSignService")` 找不到缓存实例（因为从未通过 `GenericScope.get()` 路径创建）
+- 即便让 `refresh()` 返回 `true`，下次访问 proxy 也不会触发新实例创建（因为没有 proxy）
+
+**修复**：
+- 改用 `ScopedProxyCreator.createScopedProxy(BeanDefinitionHolder, BeanDefinitionRegistry, boolean)` 显式触发代理创建
+- `ScopedProxyCreator` 是 package-private，通过反射调用；方法签名在 Spring 5.3.x / 6.0.x 中保持一致
+
+**测试结果**：
+```
+Tests run: 55, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
+
+#### 6. MetadataCollector 多 Bean 同 dataId+group 覆盖问题（P0）— 2026-07-07
+
+当多个 `@RefreshOnKeys` Bean 的 dataId/group 解析为同一值时（常见于不显式指定 dataId 的情况，均回退到 `spring.application.name`），`buildCommittedIndex()` 每次循环都创建新 `IndexEntry` 替换前一个，导致 committed index 只保留最后一个 Bean 的 key 映射，其他 Bean 的 key 完全丢失。
+
+**现象**：Nacos 配置变更后，部分 Bean 永远无法被条件刷新定位到，日志显示 `Changed keys [...] not watched by any bean`。
+
+**修复**：
+- 将 `buildCommittedIndex()` 改为两阶段构建：先用中间 `Map` 累积 `key → Set<beanName}` 映射，再统一转为不可变 `IndexEntry`
+- 多个原始条目映射到同一 `(dataId, group)` 时执行合并而非替换
+
+**测试结果**：
+```
+Tests run: 55, Failures: 0, Errors: 0, Skipped: 0
+BUILD SUCCESS
+```
+
+#### 7. ConditionalRefreshScope.refresh() 返回值语义修正（P1）— 2026-07-07
+
+`ConditionalRefreshScope.refresh()` 在 scope 中无该 Bean 缓存实例时（例如 Bean 从未通过 proxy 访问、或先前推送已销毁旧实例且新实例尚未惰性创建），原实现返回 `false`，导致调用方误判为"刷新失败"。
+
+**根因**：v2 模块（SB3.0 + SC 2022.0.x）端到端验证时发现，`@Bean` 工厂方法创建的 Bean 直接被 Spring 容器持有，不经过 `GenericScope.get()` 路径注册到 scope 缓存。当第二次 key 推送触发 `refresh()` 时，缓存已空（第一次推送已销毁旧实例），返回 `false`。
+
+**修复**：
+- `ConditionalRefreshScope.refresh()` 在无缓存实例时**返回 `true`**（而非 `false`），
+  并在 DEBUG 日志中标注"config change will take effect on next proxy access"
+- `removeBeanSafely()` 不再吞掉 `destroyMethod` 抛出的异常，改为直接委托给 `super.remove()`，
+  让调用方感知真正的失败
+- `ConditionalRefreshListener.refreshBean()` 中的 `destroyed` 变量重命名为 `effective`，
+  INFO 日志改为"config change applied"，与"配置变更已生效"语义对齐
+- 更新 `ConditionalRefreshScopeTest` 和 `ConditionalRefreshScopeSurvivalTest` 中的断言：
+  无缓存实例时预期返回 `true`，第二次刷新也预期返回 `true`
+
+### 新增
+
+#### 5. v2 测试模块升级到 SB3.0 + SC 2022.0.x（P1）— 2026-07-07
+
+`conditional-refresh-test-sample-v2` 从 SB2.7 + SC 2021.0.x（全量 context restart 模式）升级到 SB3.0.13 + SC 2022.0.5 + SCA 2022.0.0.0（轻量 RefreshEvent 模式），验证条件刷新在新一代 Spring Cloud 刷新机制下是否正常工作。
+
+**关键发现**：
+- SC 2022.0.x 的 `RefreshEventListener` 只触发轻量环境刷新，**不再触发全量 context restart**
+- 条件刷新在该场景下工作正常：key 变更 → diff → 反向索引 → 精准刷新关联 Bean
+- 需要 Java 17 编译和运行
+
+**验证日志**：
+```
+o.s.c.e.event.RefreshEventListener       : Refresh keys changed: [channel.sign.token]  ← 轻量事件
+c.l.c.l.ConditionalRefreshListener       : Affected beans ...: [channelSignService]    ← 精准定位
+c.l.c.scope.ConditionalRefreshScope      : Bean 'channelSignService' destroyed ...     ← 条件刷新
+```
+
+### 文件变更清单
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `conditional-refresh-spring-boot-starter/src/main/java/.../processor/RefreshOnKeysPostProcessor.java` | 修复 | 改用 `ScopedProxyCreator.createScopedProxy` 反射调用，正确创建 CGLIB scoped-proxy |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../processor/MetadataCollector.java` | 修复 | buildCommittedIndex 改为两阶段合并模式 |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../listener/ConditionalRefreshListener.java` | 修复 | refreshBean 变量语义从"destroyed"改为"effective"，对齐新返回值 |
+| `conditional-refresh-spring-boot-starter/src/main/java/.../scope/ConditionalRefreshScope.java` | 修复 | `refresh()` 无缓存实例时返回 `true`；`removeBeanSafely()` 不再吞异常 |
+| `conditional-refresh-spring-boot-starter/src/test/java/.../ConditionalRefreshScopeTest.java` | 修改 | 更新断言匹配新返回值语义 |
+| `conditional-refresh-spring-boot-starter/src/test/java/.../ConditionalRefreshScopeSurvivalTest.java` | 修改 | 更新断言匹配新返回值语义 |
+| `conditional-refresh-test-sample-v2/pom.xml` | 修改 | 升级到 SB3.0.13 + SC 2022.0.5 + SCA 2022.0.0.0 + Java 17 |
+| `conditional-refresh-test-sample-v2/src/main/resources/application.yml` | 修改 | 改用 `spring.config.import: nacos:` 新 API |
+| `conditional-refresh-test-sample-v2/src/main/resources/bootstrap.yml` | 删除 | SC 2022.0.x 不再需要 |
+| `conditional-refresh-test-sample-v2/src/main/java/.../TestV2Controller.java` | 修改 | 更新 Javadoc 和 health 字符串 |
+| `conditional-refresh-test-sample-v2/src/main/java/.../TestV2Beans.java` | 修改 | 更新 Javadoc |
+| `conditional-refresh-test-sample-v2/src/test/java/.../ConditionalRefreshV2SampleTest.java` | 修改 | 更新 Javadoc |
+| `CLAUDE.md` | 修改 | 更新 v2 模块版本信息 |
 
 #### 4. 新增 SB3/SB4 测试验证模块（P1）— 2026-07-06
 

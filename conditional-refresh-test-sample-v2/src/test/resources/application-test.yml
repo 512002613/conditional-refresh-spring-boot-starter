@@ -1,0 +1,18 @@
+spring:
+  application:
+    name: conditional-refresh-test-sample-v2
+
+  cloud:
+    nacos:
+      config:
+        server-addr: @nacos.server-addr@
+        namespace: @nacos.namespace@
+        group: @nacos.group@
+        file-extension: yaml
+
+server:
+  port: 0
+
+logging:
+  level:
+    com.liu.conditionalrefresh: DEBUG

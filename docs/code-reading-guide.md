@@ -1,64 +1,303 @@
-# 条件刷新框架 — 代码阅读顺序指南
+# 条件刷新框架 — 原理与代码解读
 
-> 本文档为开发者提供**由浅入深**的代码阅读路径，帮助理解 `@RefreshOnKeys` 条件刷新框架的设计思路、核心机制与实现细节。
+> 本文档面向**初学者和希望深入理解框架设计的新人开发者**，用通俗的语言讲解 `@RefreshOnKeys` 条件刷新框架的设计动机、核心原理、关键组件和代码实现。
+>
+> 阅读完本文后，你应能回答：
+> - 为什么需要"条件刷新"？它和 Spring Cloud 自带的 `@RefreshScope` 有什么本质区别？
+> - 框架是如何知道"哪些 Bean 受哪些配置 Key 影响"的？
+> - 配置变更后，框架如何精准地只刷新受影响的 Bean？
+> - 为什么必须监听 `EnvironmentChangeEvent` 而不是直接监听 Nacos 推送？
 
 ---
 
-## 一、阅读路线总览
+## 目录
+
+1. [先搞懂背景：什么是配置刷新？](#一先搞懂背景什么是配置刷新)
+2. [核心概念速览](#二核心概念速览)
+3. [框架能做什么？](#三框架能做什么)
+4. [整体架构一览](#四整体架构一览)
+5. [代码阅读顺序（由浅入深）](#五代码阅读顺序由浅入深)
+6. [运行时完整调用链路](#六运行时完整调用链路)
+7. [关键设计决策解读](#七关键设计决策解读)
+8. [测试覆盖速查](#八测试覆盖速查)
+
+---
+
+## 一、先搞懂背景：什么是配置刷新？
+
+### 1.1 问题场景
+
+想象你有一个 Spring Boot 应用，连接了腾讯云的 COS 存储。COS 的密钥配置在 Nacos 配置中心：
+
+```yaml
+cos:
+  tencent:
+    secretId:  AKVxxx...
+    secretKey: zzzzzz...
+```
+
+应用中有一个 `COSClient` Bean，启动时读取这两个密钥创建连接：
+
+```java
+@Bean
+public COSClient cosClient(Environment env) {
+    String id  = env.getProperty("cos.tencent.secretId");
+    String key = env.getProperty("cos.tencent.secretKey");
+    return new COSClient(id, key);  // 创建连接池
+}
+```
+
+**痛点**：有一天密钥泄漏了，你在 Nacos 上更新了密钥。但应用里的 `COSClient` 还是用旧密钥创建的连接——它**不知道**配置变了，除非重启应用。
+
+**传统做法**：每次改配置就重启应用。但重启意味着：
+- 服务短暂不可用
+- 所有 Bean 都要重建（包括那些跟配置变更无关的）
+- 连接池、线程池等重资源反复销毁创建
+
+### 1.2 Spring Cloud 的解决方案：`@RefreshScope`
+
+Spring Cloud 提供了 `@RefreshScope` 注解。标记了这个注解的 Bean，在环境变更时会被销毁重建：
+
+```java
+@Bean
+@RefreshScope  // 任何环境变更都会触发这个 Bean 重建
+public COSClient cosClient(Environment env) { ... }
+```
+
+**新问题**：`@RefreshScope` 是"无脑全刷"——**任意**一个配置 key 变了，所有标记了 `@RefreshScope` 的 Bean 都会被重建。
+
+假设你有 100 个 `@RefreshScope` Bean，其中一个连 Redis 的 Bean 和 COS 的 Bean 都在里面。你改了 COS 的密钥，Redis 的连接池也被销毁重建了——这完全没必要！
+
+### 1.3 本框架的方案：`@RefreshOnKeys`
+
+**核心思路**：让每个 Bean 声明"我只对这几个配置 Key 感兴趣"，只有这些 Key 变更时才重建我：
+
+```java
+@Bean
+@RefreshOnKeys({"cos.tencent.secretId", "cos.tencent.secretKey"})
+public COSClient cosClient(Environment env) { ... }
+```
+
+- 改了 `cos.tencent.secretId` → ✅ 重建 `COSClient`
+- 改了 `redis.password` → ❌ 不重建 `COSClient`
+
+这就是"条件刷新"——按条件（配置 Key）决定是否刷新。
+
+---
+
+## 二、核心概念速览
+
+在深入代码前，先统一术语：
+
+| 概念 | 通俗解释 |
+|------|----------|
+| **Nacos** | 阿里云/Alibaba 开源的配置中心。应用从 Nacos 拉取配置，Nacos 推送配置变更 |
+| **PropertySource** | Spring 内部管理配置的"数据源"。Nacos 推送后，Spring 先更新 PropertySource |
+| **EnvironmentChangeEvent** | Spring Cloud 在 PropertySource 更新**后**发布的事件，携带"哪些 key 变了" |
+| **scoped-proxy** | Spring 的一种代理模式。每次访问代理对象时，从作用域缓存中取真实实例 |
+| **GenericScope** | Spring Cloud 提供的作用域基础设施，`@RefreshScope` 底层就是它 |
+| **反向索引** | 框架的核心数据结构：`key → Set<beanName>`。从"变更的 key"反查"受影响的 Bean" |
+| **去抖（Debounce）** | 短时间内多次触发只执行最后一次。类似电梯关门——最后一个人进来后等几秒才关 |
+| **Bean 级锁** | 每个 Bean 一把独立锁。不同 Bean 可并行刷新，同一 Bean 不会并发刷新 |
+
+---
+
+## 三、框架能做什么？
+
+### 3.1 两种监听模式
+
+**精确模式**——显式列出每个监听的 key：
+
+```java
+@Bean
+@RefreshOnKeys({"cos.tencent.secretId", "cos.tencent.secretKey"})
+public COSClient cosClient(
+    @Value("${cos.tencent.secretId}") String id,
+    @Value("${cos.tencent.secretKey}") String key) {
+    return new COSClient(id, key);
+}
+```
+
+**前缀模式**——监听某个前缀下的所有 key（常用于 `@ConfigurationProperties`）：
+
+```java
+@ConfigurationProperties(prefix = "channel.sign")
+public class ChannelSignProperties {
+    private String secret;
+    private String token;
+    // getters/setters
+}
+
+@Bean
+@RefreshOnKeys(prefix = "channel.sign")  // 任何 channel.sign.* 变更都触发
+public ChannelSignService channelSignService(ChannelSignProperties props) {
+    return new ChannelSignService(props.getSecret(), props.getToken());
+}
+```
+
+### 3.2 与 `@RefreshScope` 的关系
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                                                             │
-│  ① 入口：注解定义         → 了解框架对外暴露的 API                            │
-│       ↓                                                                     │
-│  ② 配置绑定              → 了解可配置项                                      │
-│       ↓                                                                     │
-│  ③ 自动配置              → 了解 Bean 装配顺序和条件                           │
-│       ↓                                                                     │
-│  ④ 作用域 + 注册器        → 了解自定义作用域的生命周期                         │
-│       ↓                                                                     │
-│  ⑤ 后处理器（扫描改写）    → 了解 @RefreshOnKeys 如何被识别并改写              │
-│       ↓                                                                     │
-│  ⑥ 元数据收集器           → 了解反向索引的数据结构                             │
-│       ↓                                                                     │
-│  ⑦ 监听器（核心调度）      → 了解 Nacos 回调如何驱动刷新                       │
-│       ↓                                                                     │
-│  ⑧ 工具类（diff/去抖/异常）→ 了解基础工具                                     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│              Spring 容器中的 Bean                      │
+│                                                        │
+│  ┌─────────────────┐    ┌─────────────────────────┐  │
+│  │ @RefreshScope    │    │ @RefreshOnKeys           │  │
+│  │ 任意配置变更 → 刷 │    │ 只有指定 key 变更 → 刷   │  │
+│  │ 作用域: refresh  │    │ 作用域: conditionalRefresh│  │
+│  └─────────────────┘    └─────────────────────────┘  │
+│                                                        │
+│  ┌─────────────────────────────────────────────────┐  │
+│  │ 普通 Bean（无注解）— 永远不随配置变更重建          │  │
+│  └─────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────┘
+```
+
+两种注解**不能同时标记**同一个 Bean（启动时会报错）。
+
+### 3.3 行为矩阵
+
+| 触发场景 | 普通 Bean | `@RefreshScope` Bean | `@RefreshOnKeys` Bean |
+|---------|-----------|---------------------|----------------------|
+| Nacos 配置 A 变更 | 不动 | ✅ 重建 | 仅当监听 A 时重建 |
+| Nacos 配置 B 变更 | 不动 | ✅ 重建 | 仅当监听 B 时重建 |
+| 应用启动 | 创建一次 | 创建一次 | 创建一次（惰性） |
+
+---
+
+## 四、整体架构一览
+
+```
+阶段 1：编译期（开发者做的事）
+═══════════════════════════════════════════════════════════════
+
+  用 @RefreshOnKeys 标记 Bean，声明它依赖哪些配置 Key
+
+
+阶段 2：Spring 容器启动（自动配置 + 扫描改写）
+═══════════════════════════════════════════════════════════════
+
+  ConditionalRefreshAutoConfiguration
+    │  检测到 classpath 有 NacosConfigManager → 激活
+    │
+    ├─ 注册 ConditionalRefreshScope（作用域 Bean）
+    ├─ 注册 ConditionalScopeRegistrar（把 scope 注册到容器）
+    ├─ 注册 RefreshOnKeysPostProcessor（BDRPP，扫描改写 Bean 定义）
+    └─ 注册 ConditionalRefreshListener（事件监听器）
+
+  RefreshOnKeysPostProcessor.postProcessBeanDefinitionRegistry()
+    │  遍历所有 Bean 定义，找到标记了 @RefreshOnKeys 的
+    │
+    ├─ 改写：scope = "conditionalRefresh"
+    ├─ 改写：创建 CGLIB scoped-proxy（代理模式）
+    ├─ 校验：不得同时标记 @RefreshScope
+    ├─ 校验：value 和 prefix 互斥
+    └─ 收集元数据 → MetadataCollector
+         dataId → group → (beanName → {keys, prefix})
+
+
+阶段 3：Bean 实例化
+═══════════════════════════════════════════════════════════════
+
+  @RefreshOnKeys Bean → 创建 scoped-proxy 代理对象
+  真实目标对象：惰性 —— 首次通过 proxy 访问时才创建
+  （GenericScope.get() 内部缓存创建好的实例）
+
+
+阶段 4：ApplicationReadyEvent（环境就绪）
+═══════════════════════════════════════════════════════════════
+
+  ConditionalRefreshListener.onApplicationReady()
+    │
+    └─ MetadataCollector.buildCommittedIndex(environment)
+         ├─ 解析占位符 ${...}
+         ├─ 空 dataId → spring.application.name
+         ├─ 空 group  → DEFAULT_GROUP
+         └─ 构建双索引：
+              dataId → group → IndexEntry {
+                  keyToBeanNames:    key → Set<beanName>      (精确)
+                  prefixToBeanNames: prefix → Set<beanName>   (前缀)
+             }
+
+
+阶段 5：运行时（配置变更触发刷新）
+═══════════════════════════════════════════════════════════════
+
+  Nacos 推送
+    │
+    ▼
+  NacosConfigDataLoader 更新 PropertySource
+    │
+    ▼
+  ContextRefresher.refresh() → publishEvent(EnvironmentChangeEvent)
+    │
+    ├─ ConfigurationPropertiesRebinder.rebind() — 先 rebind @ConfigurationProperties
+    │
+    ▼
+  ConditionalRefreshListener.onEnvironmentChanged()     ← 之后才轮到我们
+    │  (Ordered.LOWEST_PRECEDENCE 保证顺序)
+    │
+    ├─ event.getKeys() → Set<changedKeys>
+    ├─ IndexEntry.findAffectedBeans(changedKeys) → Set<affectedBeans>
+    │    ├─ 精确匹配：changedKey 在 keyToBeanNames 中
+    │    └─ 前缀匹配：changedKey.startsWith(prefix + ".")
+    │
+    └─ 按 Bean：debouncer.debounce(beanName, refreshTask)
+         │
+         ▼  (500ms 去抖窗口后)
+    refreshBean(beanName)
+         ├─ ReentrantLock.lock()（Bean 级锁）
+         ├─ scope.refresh(beanName)
+         │    └─ super.remove("scopedTarget." + beanName) → destroyMethod
+         └─ 返回
+              │
+              ▼
+         下次通过 proxy 访问该 Bean
+              │
+              ▼
+         GenericScope.get() → ObjectFactory.getObject() → 创建新实例
+              │
+              (此时读到的是 PropertySource 中的新值 ✓)
 ```
 
 ---
 
-## 二、分步阅读指引
+## 五、代码阅读顺序（由浅入深）
 
----
+建议按以下顺序阅读源码，每一步都有明确的"阅读目标"和"你需要理解的问题"。
 
 ### 第 1 步：`RefreshOnKeys.java` — 注解定义
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/annotation/RefreshOnKeys.java`
+**路径**: `annotation/RefreshOnKeys.java`
 
-**阅读目标**: 理解框架对外暴露的 API 形态。
+**阅读目标**: 理解框架对外暴露的 API。
 
-| 关注点 | 说明 |
-|--------|------|
-| `@Target(TYPE, METHOD)` | 可用于类（@Component）和方法（@Bean） |
-| `value()` | 必填，配置键名数组 |
-| `dataId()` | 可选，默认空（自动回退到 `spring.application.name`） |
-| `group()` | 可选，默认空（自动回退到 `DEFAULT_GROUP`） |
-| 占位符支持 | 三个属性均支持 `${...}`，运行时解析 |
+**你需要理解的问题**：
+- 注解可以标在哪里？（类 or 方法）
+- 两种模式如何区分？互斥规则是什么？
+- 为什么注解本身不含 `@Scope`？
 
-**关键设计决策**：
-- 注解本身**不含** `@Scope`，作用域设置由后处理器自动完成。这样做的原因：
-  - 避免用户忘记设置 `@Scope("conditionalRefresh")`
-  - 避免与 `@RefreshScope` 语义混淆
-  - 注解扫描阶段可以更灵活地控制处理顺序
+**关键代码**：
+```java
+@Target({ElementType.TYPE, ElementType.METHOD})
+public @interface RefreshOnKeys {
+    String[] value() default {};     // 精确模式
+    String prefix() default "";      // 前缀模式（与 value 互斥）
+    String dataId() default "";
+    String group() default "";
+}
+```
+
+**设计决策**：注解不含 `@Scope`，作用域由后处理器自动设置。这样做的原因：
+1. 避免用户忘记手动加 `@Scope("conditionalRefresh")`
+2. 避免与 `@RefreshScope` 语义混淆
+3. 后处理器可以在扫描阶段灵活控制处理顺序
 
 ---
 
 ### 第 2 步：`ConditionalRefreshProperties.java` — 配置绑定
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/config/ConditionalRefreshProperties.java`
+**路径**: `config/ConditionalRefreshProperties.java`
 
 **阅读目标**: 了解所有可配置项及其默认值。
 
@@ -67,393 +306,539 @@
 | `conditional.refresh.enabled` | `true` | 全局开关 |
 | `conditional.refresh.debounce.delay` | `500` ms | 去抖静默窗口 |
 | `conditional.refresh.metrics-enabled` | `true` | 是否暴露 Micrometer 指标 |
-| `conditional.refresh.initial-snapshot-enabled` | `true` | 是否启用初始快照 |
-
-**阅读要点**：
-- 类级别 Javadoc 中包含完整的 YAML 配置示例
-- 所有 getter/setter 都有完整 Javadoc
+| `conditional.refresh.initial-snapshot-enabled` | `true` | 旧版兼容属性 |
 
 ---
 
 ### 第 3 步：`ConditionalRefreshAutoConfiguration.java` — 自动配置
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/config/ConditionalRefreshAutoConfiguration.java`
+**路径**: `config/ConditionalRefreshAutoConfiguration.java`
 
 **阅读目标**: 理解框架的 Bean 装配条件和顺序。
 
-```
-装配条件（同时满足）：
-  1. classpath 存在 NacosConfigManager
-  2. Spring 容器中已有 NacosConfigManager Bean
-  3. conditional.refresh.enabled 不为 false
+**你需要理解的问题**：
+- 什么条件下框架才会激活？
+- 各个 Bean 注册的顺序有什么讲究？
+- 用户如何替换框架的默认实现？
 
-装配顺序（@AutoConfigureAfter 保证）：
-  ① NacosConfigAutoConfiguration（Spring Cloud Alibaba 原生）
-  ② ConditionalRefreshScope         —— 作用域 Bean
-  ③ ConditionalScopeRegistrar        —— BeanFactoryPostProcessor，注册作用域
-  ④ RefreshOnKeysPostProcessor       —— BDRPP，扫描改写 Bean 定义
-  ⑤ ConditionalRefreshListener       —— ApplicationListener，注册 Nacos 监听器
-```
+**装配条件（同时满足）**：
+1. classpath 存在 `NacosConfigManager`
+2. Spring 容器中已有 `NacosConfigManager` Bean
+3. `conditional.refresh.enabled` 不为 `false`
 
 **关键理解**：
-- `@ConditionalOnMissingBean` 全部使用，允许用户替换框架默认实现
-- `ConditionalScopeRegistrar` 通过构造注入 `ConditionalRefreshScope`，保证注册器与监听器引用**同一个** scope 实例（修复历史 Bug）
+- 所有 Bean 都标注了 `@ConditionalOnMissingBean`——意味着用户只要自己声明了同名 Bean，就能替换框架默认实现
+- `@AutoConfigureAfter(NacosConfigAutoConfiguration)` 保证 Nacos 配置管理器先注册
 
 ---
 
 ### 第 4 步：`ConditionalRefreshScope.java` + `ConditionalScopeRegistrar.java`
 
 **路径**:
-- `src/main/java/com/liu/conditionalrefresh/scope/ConditionalRefreshScope.java`
-- `src/main/java/com/liu/conditionalrefresh/scope/ConditionalScopeRegistrar.java`
+- `scope/ConditionalRefreshScope.java`
+- `scope/ConditionalScopeRegistrar.java`
 
 **阅读目标**: 理解自定义作用域的生命周期。
 
-#### 4.1 `ConditionalRefreshScope` — 作用域实现
+#### 4.1 `ConditionalScopeRegistrar` — 作用域注册器
 
-```
-继承 GenericScope（Spring Cloud 提供）
-  ↓
-作用域名称: "conditionalRefresh"
-  ↓
-refresh(String beanName)  →  从缓存移除旧实例（惰性重建）
-  ↓
-removeBeanSafely()        →  安全移除（destroyMethod 异常不阻断）
+它的任务只有一个：在 Spring 容器初始化阶段把 `ConditionalRefreshScope` 实例注册为名为 `"conditionalRefresh"` 的作用域。
+
+```java
+public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+    beanFactory.registerScope("conditionalRefresh", scope);
+}
 ```
 
-**惰性重建语义**：
-- `refresh()` 仅销毁旧实例
-- 新实例在下一次通过 scoped-proxy 访问时由 `GenericScope.get()` 惰性创建
-- 好处：不阻塞 Nacos 回调线程、对齐原生 RefreshScope 行为
+**为什么要单独一个注册器**？因为作用域必须在任何 Bean **实例化之前**注册。通过 `BeanFactoryPostProcessor` 可以精确控制这个时机。
 
-#### 4.2 `ConditionalScopeRegistrar` — 作用域注册器
+#### 4.2 `ConditionalRefreshScope` — 作用域实现
 
+继承 Spring Cloud 的 `GenericScope`，复用了 Bean 创建、缓存、`destroyMethod` 等基础设施。
+
+**核心方法 `refresh(String beanName)`**：
+
+```java
+public boolean refresh(String beanName) {
+    // 1. 移除旧实例（执行 destroyMethod）
+    Object oldInstance = removeBeanSafely(beanName);
+    
+    if (oldInstance == null) {
+        // 检查 survivor cache（跨 context restart 场景）
+        Object survivor = SURVIVOR_CACHE.remove(beanName);
+        if (survivor != null) { return true; }
+        
+        // 缓存中无该 Bean → 不是失败，配置变更下次 proxy 访问时生效
+        return true;
+    }
+    
+    // 2. 旧实例已销毁，新实例尚未创建
+    //    真正的重建将在下次通过 scoped-proxy 访问时触发
+    return true;
+}
 ```
-BeanFactory.postProcessBeanFactory()
-  ↓
-beanFactory.registerScope("conditionalRefresh", scope)
-  ↓
-scope 实例来自容器注入（非 new），保证全局唯一
-```
+
+**你需要理解的关键点**：
+- `refresh()` **只销毁、不创建**——新实例是惰性创建的
+- `GenericScope` 内部用 `"scopedTarget." + beanName` 作为缓存 key，所以 `removeBeanSafely()` 需要手动拼这个前缀
+- `SURVIVOR_CACHE` 是个静态 Map，用于跨 context restart 场景（SC 2021.0.x 全量 restart 会销毁旧 scope 实例，但是监听器里记住的 beanName 还在）
+
+**惰性重建的好处**：
+1. 不阻塞事件发布线程
+2. 对齐原生 `RefreshScope` 的行为
+3. 自然配合去抖（快速多次变更只触发一次最终访问）
 
 ---
 
 ### 第 5 步：`RefreshOnKeysPostProcessor.java` — Bean 定义扫描改写
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/processor/RefreshOnKeysPostProcessor.java`
+**路径**: `processor/RefreshOnKeysPostProcessor.java`
 
 **阅读目标**: 理解 `@RefreshOnKeys` 如何被识别、改写和收集。
 
-#### 处理流程
+**你需要理解的问题**：
+- 这个后处理器在 Spring 生命周期的什么阶段运行？
+- 为什么改写 Bean 定义而不是改写已创建的实例？
+- scoped-proxy 是如何创建的？
+
+**运行时机**：`BeanDefinitionRegistryPostProcessor` 阶段——在所有 Bean 定义加载后、任何 Bean **实例化之前**。
+
+**处理流程**：
 
 ```
 postProcessBeanDefinitionRegistry()
+  │
   ├─ 遍历所有 Bean 定义
   │   └─ processBeanDefinition(beanName, bd)
-  │       ├─ ① findAnnotation(bd)         → 查找 @RefreshOnKeys
-  │       │   ├─ 场景 A：@Bean 方法 → 读取工厂方法元数据
-  │       │   └─ 场景 B：@Component 类 → 读取类级元数据
+  │       ├─ ① findAnnotation(bd)         → 找到 @RefreshOnKeys
+  │       │   ├─ @Bean 方法 → 读工厂方法元数据
+  │       │   └─ @Component 类 → 读类级元数据
   │       │
   │       ├─ ② checkRefreshScopeConflict()  → 互斥校验
-  │       │   └─ 若同时有 @RefreshScope → 抛出 BeanDefinitionStoreException
   │       │
-  │       ├─ ③ rewriteBeanDefinition()      → 改写 scope + proxyMode
+  │       ├─ ③ rewriteBeanDefinition()      → 改写 scope + 创建 proxy
   │       │   ├─ abd.setScope("conditionalRefresh")
-  │       │   └─ 反射设置 proxyMode = TARGET_CLASS
+  │       │   └─ 创建 CGLIB scoped-proxy（通过反射调用 ScopedProxyCreator）
   │       │
-  │       └─ ④ collector.add(...)            → 收集元数据（不触发实例化）
-  │
-  └─ postProcessBeanFactory()  → 空实现（所有逻辑在 BDRPP 阶段完成）
+  │       ├─ ④ 互斥校验（value vs prefix）
+  │       │
+  │       └─ ⑤ collector.add(...)           → 收集元数据
 ```
 
-#### 核心反射逻辑
+**核心反射逻辑**：
 
 ```java
-// proxyMode 字段为 int 类型，需要：
-// 1. 反射访问
-// 2. 使用 setInt() 而非 set()
-// 3. 传 ScopedProxyMode.TARGET_CLASS.ordinal()
-Field proxyModeField = AbstractBeanDefinition.class.getDeclaredField("proxyMode");
-proxyModeField.setInt(abd, ScopedProxyMode.TARGET_CLASS.ordinal());
+// ScopedProxyCreator 是 package-private 的，需要反射调用
+Class<?> creatorClass = Class.forName(
+    "org.springframework.context.annotation.ScopedProxyCreator");
+Method method = creatorClass.getMethod(
+    "createScopedProxy", BeanDefinitionHolder.class,
+    BeanDefinitionRegistry.class, boolean.class);
+BeanDefinitionHolder proxyHolder = 
+    (BeanDefinitionHolder) method.invoke(null, holder, registry, true);
 ```
 
-**为什么不用 `setProxyMode()` 方法？**
-- Spring 的 `AbstractBeanDefinition` 在部分版本中 `setProxyMode()` 访问受限
-- 反射方式兼容 Spring 5.x 全系列版本
+**为什么要用 `ScopedProxyCreator` 而不是直接 `setProxyMode()`**：
+- 直接 `setProxyMode()` 在部分 Spring 版本中因为 Bean 覆盖限制无法正确创建代理
+- `ScopedProxyCreator.createScopedProxy()` 是 Spring 创建 scoped-proxy 的标准方法，内部处理了所有细节
+
+**改写后的 Bean 定义结构**：
+
+```
+注册表中有两个定义：
+  "channelSignService"          → ScopedProxyFactoryBean（代理）
+  "scopedTarget.channelSignService" → 原始定义（目标）
+
+注入点拿到的是代理对象，每次方法调用时：
+  代理.intercept() → GenericScope.get("scopedTarget.channelSignService")
+                   → 从缓存取真实实例（或惰性创建）
+```
 
 ---
 
 ### 第 6 步：`MetadataCollector.java` — 元数据收集器
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/processor/MetadataCollector.java`
+**路径**: `processor/MetadataCollector.java`
 
 **阅读目标**: 理解反向索引的数据结构和构建时机。
 
-#### 数据结构（两层）
+**你需要理解的问题**：
+- 为什么需要"两阶段"设计（先 raw 后 committedIndex）？
+- 反向索引具体长什么样？
+- 前缀匹配是怎么实现的？
+
+#### 数据结构
 
 ```
-原始数据（raw）—— BDRPP 阶段收集，占位符未解析
-  dataId → group → (beanName → Set<rawKeys>)
+原始数据（raw）—— BDRPP 阶段收集
+  dataId → group → (beanName → RawEntry{keys, prefix})
 
-反向索引（committedIndex）—— ApplicationReadyEvent 后构建，占位符已解析
-  dataId → group → IndexEntry(keyToBeanNames)
-                              └─ key → Set<beanName>
+反向索引（committedIndex）—— ApplicationReadyEvent 后构建
+  dataId → group → IndexEntry {
+      keyToBeanNames:    key → Set<beanName>      ← 精确匹配
+      prefixToBeanNames: prefix → Set<beanName>   ← 前缀匹配
+  }
 ```
 
-#### 构建流程
+#### 两阶段设计的原因
 
+BDRPP 阶段 Environment 还没完全就绪（Nacos 配置还没加载），此时无法解析 `${...}` 占位符。所以：
+- 第一阶段：轻量收集原始字符串，不解析
+- 第二阶段（ApplicationReadyEvent）：Environment 就绪后再解析占位符、构建索引
+
+#### 查找受影响 Bean 的逻辑
+
+```java
+public Set<String> findAffectedBeans(Set<String> changedKeys) {
+    Set<String> affected = new HashSet<>();
+    
+    // 1. 精确匹配：changedKey 在 keyToBeanNames 中
+    for (String key : changedKeys) {
+        Set<String> beans = keyToBeanNames.get(key);
+        if (beans != null) affected.addAll(beans);
+    }
+    
+    // 2. 前缀匹配：changedKey 以某个 prefix + "." 开头
+    if (!prefixToBeanNames.isEmpty()) {
+        for (String changedKey : changedKeys) {
+            for (prefixEntry : prefixToBeanNames.entrySet()) {
+                if (changedKey.startsWith(prefixEntry.getKey() + ".")) {
+                    affected.addAll(prefixEntry.getValue());
+                }
+            }
+        }
+    }
+    return affected;
+}
 ```
-add() —— 多次调用，轻量收集
-  ↓
-buildCommittedIndex(env) —— 一次性构建
-  ├─ 解析空 dataId → spring.cloud.nacos.config.prefix → spring.application.name
-  ├─ 解析空 group  → spring.cloud.nacos.config.group → DEFAULT_GROUP
-  ├─ 解析每个 key 中的 ${...} 占位符
-  ├─ 检测不存在的 key → 输出 warn（继续注册）
-  └─ 构建完成后：raw.clear() 释放内存
-```
 
-#### 内部类
-
-| 类 | 作用 |
-|----|------|
-| `DataGroupKey` | (dataId, group) 组合键，不可变 |
-| `IndexEntry` | 反向索引条目，提供 `findAffectedBeans()` 方法 |
+**举例**：
+- Bean A 标记 `@RefreshOnKeys({"channel.sign.secret"})` → keyToBeanNames: `{"channel.sign.secret" → {A}}`
+- Bean B 标记 `@RefreshOnKeys(prefix = "channel.sign")` → prefixToBeanNames: `{"channel.sign" → {B}}`
+- 变更 key = `channel.sign.secret` → A（精确匹配）+ B（前缀匹配）→ 两个都刷
 
 ---
 
 ### 第 7 步：`ConditionalRefreshListener.java` — 核心调度器
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/listener/ConditionalRefreshListener.java`
+**路径**: `listener/ConditionalRefreshListener.java`
 
 **阅读目标**: 理解配置变更如何驱动 Bean 刷新。
 
-#### 启动注册流程
+**你需要理解的问题**：
+- 框架现在如何感知配置变更？（对比旧版直接监听 Nacos SDK 有什么不同）
+- 为什么监听器必须在 `ConfigurationPropertiesRebinder` 之后执行？
+- 两个事件（EnvironmentChangeEvent / RefreshScopeRefreshedEvent）分别在什么场景触发？
 
-```
-onApplicationEvent(ApplicationReadyEvent)
-  ├─ ① isEnabled() 检查全局开关
-  ├─ ② collector.isEmpty() 检查是否有 Bean 需要监听
-  ├─ ③ collector.buildCommittedIndex(env) 构建最终索引
-  └─ ④ 遍历 (dataId, group) 组合 → registerListener()
-      ├─ 4a. fetchInitialSnapshot()  → 获取初始快照（避免首次全量刷新）
-      ├─ 4b. new ListenerContext()    → 创建上下文（含快照、去抖器）
-      ├─ 4c. addNacosListener(dataId, group)  → 注册原始 dataId 监听器
-      └─ 4d. 若 file-extension 非空且 dataId 未以后缀结尾
-          └─ addNacosListener(dataId + "." + ext, group)  → 同时注册带后缀监听器
-```
+#### 事件监听机制
 
-#### file-extension 双监听器机制
-
-Nacos 2.x 在 `file-extension: yaml` 时，实际存储/推送的 dataId 会追加 `.yaml` 后缀。框架通过以下机制兼容：
-
-1. **注册阶段**：`registerListener()` 自动检测 `spring.cloud.nacos.config.file-extension`，若存在则同时注册 `dataId` 与 `dataId.fileExtension` 两个 Nacos 监听器
-2. **回调阶段**：`getContext()` 先按原始 dataId 查找，若失败且 dataId 以扩展名后缀结尾，则去除后缀后回退查找
-
-这保证了无论 Nacos 服务端以哪种 dataId 形式推送，框架均能正确路由到对应的 `ListenerContext`。
-
-#### 运行时处理流程（每次配置变更）
-
-```
-receiveConfigInfo(configInfo)
-  ↓
-handleChange(dataId, group, configInfo)
-  ├─ ① ConfigDiffUtils.parse()        → 解析新快照
-  ├─ ② ctx.replaceSnapshotAndGetOld() → 原子替换快照（getAndSet）
-  ├─ ③ ConfigDiffUtils.diff()         → 计算变更 keys
-  ├─ ④ ctx.findAffectedBeans()        → 反向索引定位受影响 Bean
-  └─ ⑤ debouncer.debounce()           → 去抖调度
-      ↓ （延迟执行后）
-  refreshBean(beanName)
-      ├─ ReentrantLock.lock()          → Bean 级锁
-      ├─ scope.refresh(beanName)       → 销毁旧实例
-      └─ lock.unlock()
+```java
+public class ConditionalRefreshListener
+        implements SmartApplicationListener, Ordered, AutoCloseable {
+    
+    @Override
+    public boolean supportsEventType(Class<? extends ApplicationEvent> eventType) {
+        return ApplicationReadyEvent.class.isAssignableFrom(eventType)
+            || EnvironmentChangeEvent.class.isAssignableFrom(eventType)
+            || RefreshScopeRefreshedEvent.class.isAssignableFrom(eventType);
+    }
+}
 ```
 
-#### 并发安全机制
+**三个事件各有用途**：
 
-| 机制 | 作用 |
-|------|------|
-| `AtomicReference<Map>` (snapshot) | 保证快照读-写原子性，避免并发覆盖 |
-| `ConcurrentHashMap` (contexts, beanLocks) | 线程安全的集合操作 |
-| `ReentrantLock` (per-bean) | 同一 Bean 串行刷新，不同 Bean 并行 |
-| `Debouncer` (per-context) | 抑制短时间内的重复刷新 |
-| `volatile committedIndex` | 保证初始化时的内存可见性 |
+| 事件 | 何时触发 | 处理逻辑 |
+|------|----------|----------|
+| `ApplicationReadyEvent` | 应用启动完成 | 构建反向索引 |
+| `EnvironmentChangeEvent` | PropertySource 更新后（SC 2022.0.x+） | 精准刷新受影响 Bean |
+| `RefreshScopeRefreshedEvent` | RefreshScope.refreshAll() 完成后（SC 2021.0.x fallback） | 全量刷新所有 Bean |
 
----
+#### 为什么是 EnvironmentChangeEvent 而不是直接监听 Nacos SDK？
 
-### 第 8 步：工具类详解
-
-#### 8.1 `ConfigDiffUtils.java` — 配置解析与 diff
-
-**路径**: `src/main/java/com/liu/conditionalrefresh/listener/ConfigDiffUtils.java`
+这是框架最近一次重大重构的核心原因——**时序倒置 bug**：
 
 ```
-parse(configText)
-  ├─ null/blank 检查
-  ├─ isYamlStyle() 启发式判断格式
-  ├─ parseYaml()  → YAMLPropertySourceLoader → flattenMap()
-  │   └─ 失败 → log.warn() + 回退 parseProperties()
-  └─ parseProperties() → java.util.Properties.load()
+旧实现的问题：
+  Nacos 推送 → configService.addListener 回调 → 立即销毁 Bean
+       ↑ 此时 PropertySource 还没更新（要等 190ms）
+       ↑ 新实例惰性创建时读到的还是旧值 → 条件刷新白做
 
-diff(oldSnapshot, newSnapshot)
-  ├─ 遍历 newSnapshot
-  │   ├─ old 不含 key → 新增 → 加入 changed
-  │   └─ old 含 key 但值不等 → 修改 → 加入 changed
-  └─ 旧键被删除 → 忽略（减少无效刷新）
+新实现（PropertySource-First）：
+  Nacos 推送 → NacosConfigDataLoader 更新 PropertySource
+            → ContextRefresher.refresh()
+            → publishEvent(EnvironmentChangeEvent)
+            → ConditionalRefreshListener.onEnvironmentChanged()
+            → 销毁 Bean → 下次访问读新值 ✓
 ```
 
-#### 8.2 `Debouncer.java` — 去抖器
+#### 监听器顺序的重要性
 
-**路径**: `src/main/java/com/liu/conditionalrefresh/listener/Debouncer.java`
-
-```
-debounce(key, task)
-  ├─ 检查 shutdown 状态
-  ├─ 取消 previous 任务
-  └─ scheduler.schedule(newTask, delay, unit)
-      └─ 执行时:
-          ├─ pending.remove(key)
-          ├─ task.run()
-          └─ 异常→ log.error() + recordFailure()
+```java
+@Override
+public int getOrder() {
+    return Ordered.LOWEST_PRECEDENCE;  // 整数最大值 → 最后执行
+}
 ```
 
-**为什么是多线程池调度器？**
-- 默认线程池大小为 `max(2, CPU 核心数)`
-- 不同 (dataId, group) 的刷新任务可并行执行
-- 同一 key 的去重由 `pending ConcurrentHashMap` 保证
-- 配合外层 Bean 级锁，形成完整的并发控制（同一 Bean 串行，不同 Bean 并行）
-
-#### 8.3 `ListenerContext.java` — 监听器上下文
-
-**路径**: `src/main/java/com/liu/conditionalrefresh/listener/ListenerContext.java`
+Spring 的事件派发是**同步顺序**的。`EnvironmentChangeEvent` 到达时：
 
 ```
-每个 (dataId, group) 对应一个 ListenerContext 实例：
-  ├─ lastSnapshot:  AtomicReference<Map>     ← 原子快照
-  ├─ indexEntry:    IndexEntry               ← 反向索引（委托 findAffectedBeans）
-  └─ debouncer:     Debouncer                ← 去抖器（多线程池）
-```
-
-#### 8.4 `RefreshFailedException.java` — 刷新失败异常
-
-**路径**: `src/main/java/com/liu/conditionalrefresh/exception/RefreshFailedException.java`
-
-- 携带 `beanName` 和原始 `cause`
-- **`@Deprecated`**：当前版本未主动抛出（预留用于未来扩展）
-- 框架当前策略：刷新失败 → log.error + Micrometer 指标 → 不阻塞其他 Bean
-
----
-
-## 三、启动时序图
-
-```
-Spring Boot 启动
+publishEvent(EnvironmentChangeEvent)
   │
-  ├─ 扫描 @Configuration → ConditionalRefreshAutoConfiguration
-  │   ├─ 满足 @ConditionalOnClass + @ConditionalOnBean + @ConditionalOnProperty
-  │   └─ 注册 5 个 Bean
+  ├─ ConfigurationPropertiesRebinder.rebind()  ← 先执行（rebind @ConfigurationProperties）
   │
-  ├─ BeanFactoryPostProcessor 执行阶段
-  │   ├─ ConditionalScopeRegistrar.postProcessBeanFactory()
-  │   │   └─ registerScope("conditionalRefresh", scope)
-  │   │
-  │   └─ RefreshOnKeysPostProcessor.postProcessBeanDefinitionRegistry()
-  │       ├─ 扫描 @RefreshOnKeys 注解
-  │       ├─ 改写 Bean 定义（scope + proxyMode）
-  │       └─ 收集元数据到 MetadataCollector
+  └─ ConditionalRefreshListener.onEnvironmentChanged()  ← 后执行（我们的顺序值最大）
+```
+
+**为什么要在 rebinder 之后？** 因为 `@RefreshOnKeys` 前缀模式的典型用法是注入 `@ConfigurationProperties` Bean 作为工厂参数。如果我们的 listener 先执行，rebinder 还没发生，新实例拿到的 Properties Bean 还是旧值。
+
+#### SC 2021.0.x fallback 路径
+
+```java
+public void onRefreshScopeRefreshed(RefreshScopeRefreshedEvent event) {
+    // 主路径已处理 → 跳过，避免重复刷新
+    if (environmentChangeEventHandled) {
+        environmentChangeEventHandled = false;
+        return;
+    }
+    // SC 2021.0.x 无法从 EnvironmentChangeEvent 获取有效 keys
+    // 降级方案：全量刷新所有 @RefreshOnKeys Bean
+    Set<String> allBeans = collector.getAllBeanNames();
+    for (String beanName : allBeans) {
+        debouncer.debounce(beanName, () -> refreshBean(beanName));
+    }
+}
+```
+
+#### 去抖 + 锁的并发控制
+
+```java
+private void refreshBean(String beanName) {
+    ReentrantLock lock = beanLocks.computeIfAbsent(beanName, k -> new ReentrantLock());
+    lock.lock();
+    try {
+        boolean effective = scope.refresh(beanName);  // 销毁旧实例
+        if (effective) {
+            recordSuccess(beanName);  // Micrometer 指标
+        } else {
+            recordFailure(beanName);
+        }
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+- **Debouncer**（外层）：500ms 窗口内多次触发只执行最后一次
+- **ReentrantLock**（内层）：保证同一 Bean 不并发刷新，不同 Bean 可并行
+
+---
+
+### 第 8 步：`Debouncer.java` — 去抖器
+
+**路径**: `listener/Debouncer.java`
+
+**阅读目标**: 理解去抖的实现和线程模型。
+
+**你需要理解的问题**：
+- 去抖和"防抖"是同一个东西吗？
+- 为什么用多线程池而不是单线程？
+- 任务抛异常会怎样？
+
+#### 核心逻辑
+
+```java
+public void debounce(String key, Runnable task) {
+    // 1. 取消同一 key 之前未执行的任务
+    ScheduledFuture<?> prev = pending.get(key);
+    if (prev != null) prev.cancel(false);
+    
+    // 2. 调度新的任务（delay 后执行）
+    ScheduledFuture<?> future = scheduler.schedule(() -> {
+        pending.remove(key);
+        try {
+            task.run();
+        } catch (Exception e) {
+            log.error("...", e);
+            recordFailure(key);  // 异常不阻断后续任务
+        }
+    }, delay, unit);
+    
+    pending.put(key, future);
+}
+```
+
+**为什么异常要捕获而不是抛出？** 因为任务在 `ScheduledExecutorService` 中运行，未捕获的异常会导致该 slot 永远"消失"，后续调度全部丢失。
+
+#### 线程模型
+
+- 线程池大小 = `max(2, CPU 核心数)`
+- 不同 Bean 的刷新任务可**并行**
+- 同一 Bean 的去重由 `pending` ConcurrentHashMap 保证
+- 同一 Bean 的并发控制由外层 `ReentrantLock` 保证
+
+---
+
+### 第 9 步：`ConfigDiffUtils.java` — 配置解析与 diff
+
+**路径**: `listener/ConfigDiffUtils.java`
+
+**阅读目标**: 了解配置格式解析和 diff 计算逻辑。
+
+**注意**：这个工具类是早期版本的产物。在新架构下（监听 `EnvironmentChangeEvent`），框架不再需要自己解析配置和计算 diff——Spring 的 `ContextRefresher` 已经帮你做完了，通过 `EnvironmentChangeEvent.getKeys()` 直接拿到变更的 keys。
+
+保留这个类是为了兼容性，未来可能移除。
+
+---
+
+## 六、运行时完整调用链路
+
+下面是配置变更从 Nacos 推送到 Bean 成功刷新的**完整时序**，包含每一步的日志输出：
+
+```
+时间轴 →
+
+Nacos 服务端
+  │  推送配置变更
+  ▼
+NacosConfigDataLoader（Spring Cloud Alibaba）
+  │  更新 PropertySource
+  ▼
+ContextRefresher.refresh()
+  │  refreshEnvironment(): 更新 PropertySource + publishEvent(EnvironmentChangeEvent)
+  ▼
+SimpleApplicationEventMulticaster 顺序派发
   │
-  ├─ Bean 实例化阶段
-  │   ├─ @RefreshOnKeys Bean → scoped-proxy 代理
-  │   └─ 其他 Bean → 正常创建
+  ├─ [1] ConfigurationPropertiesRebinder.onApplicationEvent()
+  │      rebind 所有 @ConfigurationProperties Bean
+  │      日志: o.s.c.c.properties.ConfigurationPropertiesRebinders : Rebinding
   │
-  └─ ApplicationReadyEvent 发布
-      └─ ConditionalRefreshListener.onApplicationEvent()
-          ├─ buildCommittedIndex()  → 解析占位符 + 构建反向索引
-          ├─ fetchInitialSnapshot() → 获取初始快照
-          └─ configService.addListener() → 注册 Nacos 监听器
+  └─ [2] ConditionalRefreshListener.onEnvironmentChanged() ← 我们
+         │
+         ├─ event.getKeys() → [channel.sign.secret]
+         │   DEBUG: Environment changed, keys: [channel.sign.secret]
+         │
+         ├─ findAffectedBeans([channel.sign.secret])
+         │   ├─ 精确匹配：channelSignService（value 模式）
+         │   └─ 前缀匹配：channelSignService（prefix="channel.sign"）
+         │   INFO: Affected beans for changed keys [channel.sign.secret]: [channelSignService]
+         │
+         ├─ debouncer.debounce("channelSignService", refreshTask)
+         │   └─ 调度 500ms 后执行
+         │
+         └── (500ms 后)
+              │
+              ▼
+         refreshBean("channelSignService")
+              ├─ lock.lock()
+              ├─ scope.refresh("channelSignService")
+              │   └─ super.remove("scopedTarget.channelSignService")
+              │       └─ destroyMethod 执行（如 close/shutdown）
+              │   INFO: Bean 'channelSignService' destroyed in conditional refresh scope.
+              ├─ recordSuccess("channelSignService")
+              │   └─ conditional.refresh.success +1 (Micrometer)
+              └─ lock.unlock()
+              
+  ════════════════════════════════════════════════════════════════
+  此时旧实例已销毁，但新实例尚未创建
+  ════════════════════════════════════════════════════════════════
+  
+  下次有代码通过 proxy 访问 channelSignService：
+  │  代理.intercept() → GenericScope.get("scopedTarget.channelSignService")
+  │
+  ▼
+  ObjectFactory.getObject()
+      │  执行工厂方法：channelSignService(channelSignProperties)
+      │  此时 channelSignProperties 已 rebind → 拿到新值 ✓
+      ▼
+  新实例创建并缓存到 scope
 ```
 
 ---
 
-## 四、运行时调用链路（完整）
+## 七、关键设计决策解读
 
-```
-                     Nacos Server
-                         │
-                   推送 config change
-                         │
-              ┌──────────▼──────────┐
-              │  Listener.receive()  │
-              └──────────┬──────────┘
-                         │
-              ┌──────────▼──────────┐
-              │    handleChange()    │
-              │  ① parse 新快照       │
-              │  ② replaceSnapshot   │
-              │  ③ diff 计算变更 keys │
-              │  ④ findAffectedBeans │
-              └──────────┬──────────┘
-                         │
-              ┌──────────▼──────────┐
-              │  Debouncer.debounce()│  ← 500ms 去抖窗口
-              └──────────┬──────────┘
-                         │ (延迟后执行)
-              ┌──────────▼──────────┐
-              │   refreshBean()      │
-              │  ReentrantLock.lock()│
-              │  scope.refresh()     │
-              └──────────┬──────────┘
-                         │
-              ┌──────────▼──────────┐
-              │ GenericScope.remove()│
-              │  destroyMethod()    │
-              └──────────┬──────────┘
-                         │
-              ┌──────────▼──────────┐
-              │  下次 proxy 访问      │
-              │  GenericScope.get() │
-              │  ObjectFactory 重建  │
-              └─────────────────────┘
-```
+### 决策 1：为什么监听 Spring 事件而不是 Nacos SDK 回调？
 
----
+**问题**：Nacos SDK 的 `configService.addListener()` 在 Spring 更新 PropertySource **之前**就触发回调，导致 Bean 销毁重建时读到旧值。
 
-## 五、关键设计决策索引
+**本质**：Nacos 推送和 Spring 配置更新是两个独立步骤。SDK 回调只告诉你"Nacos 存储变了"，但不等于"Spring 环境变了"。
 
-| 决策 | 文件 | 原因 |
-|------|------|------|
-| 注解不含 `@Scope` | `RefreshOnKeys` | 由后处理器统一设置，避免遗漏 |
-| 作用域实例注入而非 new | `ConditionalScopeRegistrar` | 避免注册器/监听器引用不同实例 |
-| 初始快照 | `ConditionalRefreshListener` | 避免首次推送触发全量刷新 |
-| 反向索引（key→beans） | `MetadataCollector` | O(1) 定位受影响 Bean |
-| 原子快照替换 | `ListenerContext` | 避免并发覆盖导致 diff 丢失 |
-| Bean 级锁而非全局锁 | `ConditionalRefreshListener` | 不同 Bean 可并行刷新 |
-| 删除 key 不触发刷新 | `ConfigDiffUtils` | 减少无效刷新 |
-| 惰性重建（不立即创建） | `ConditionalRefreshScope` | 不阻塞 Nacos 回调线程 |
-| Micrometer 弱依赖 | `Debouncer`, `Listener` | 框架不要求必须引入 Micrometer |
-| proxyMode 反射设置 | `RefreshOnKeysPostProcessor` | 兼容 Spring 5.x 全系列 |
-| file-extension 双监听器 | `ConditionalRefreshListener` | 兼容 Nacos 2.x 自动追加扩展名行为 |
+**正确做法**：监听 Spring Cloud 发布的 `EnvironmentChangeEvent`——这是 PropertySource 更新**之后**才发布的操作。
+
+### 决策 2：为什么监听器必须在 `ConfigurationPropertiesRebinder` 之后？
+
+**问题**：前缀模式的典型用法是整个 `@ConfigurationProperties` Bean 注入工厂方法。如果我们的 listener 先执行，`@ConfigurationProperties` Bean 还没 rebind，新实例拿到旧值。
+
+**解法**：`getOrder()` 返回 `Ordered.LOWEST_PRECEDENCE`（整数最大值）→ 在所有"正常"监听器之后执行。
+
+### 决策 3：为什么用 scoped-proxy 而不是直接持有引用？
+
+**问题**：Spring 注入的 Bean 引用如果是普通引用，永远是同一个对象。需要一种机制让"下次访问时自动拿到新实例"。
+
+**解法**：scoped-proxy 是 Spring 的标准解法。注入点拿到的是代理对象，每次方法调用时从作用域缓存中取真实实例。这样 Bean 销毁（`refresh()`）后，下次调用 proxy 就会触发重新创建。
+
+### 决策 4：为什么只销毁不立即重建？
+
+1. **不阻塞事件线程**——事件发布是同步的，如果在这里创建新实例（可能涉及建连、IO），会阻塞所有后续监听器
+2. **对齐原生 `RefreshScope` 语义**——原生也是惰性重建
+3. **自然配合去抖**——快速多次变更只触发一次最终重建
+
+### 决策 5：为什么需要"两阶段"构建索引？
+
+BDRPP 阶段（`add()`）Environment 还没完全就绪（Nacos 远程配置尚未加载），此时 `${...}` 占位符无法解析。所以：
+- 第一阶段：轻量收集原始字符串
+- 第二阶段（`ApplicationReadyEvent`）：Environment 就绪后统一解析、构建索引
+
+### 决策 6：为什么 SC 2021.0.x 要降级为全量刷新？
+
+SC 2021.0.x 使用 `LegacyContextRefresher`，在配置变更时执行**全量 context restart**（创建新 `SpringApplication` 并启动新 context）。这个过程中：
+- 旧 context 被整个废弃
+- `EnvironmentChangeEvent` 在新 context 中不会再次发布
+- 条件监听器无法获取 changedKeys
+
+由于全量 restart 本身就会重建所有 Bean，条件刷新的"精确"优势在该版本本就打折。降级为"全量刷新所有 `@RefreshOnKeys` Bean"是合理的兼容方案。
 
 ---
 
-## 六、测试对应关系
+## 八、测试覆盖速查
 
-| 测试类 | 覆盖模块 | 关键测试点 |
-|--------|----------|------------|
-| `ConfigDiffUtilsTest` | `ConfigDiffUtils` | Properties/YAML 解析、diff 语义、空配置边界（11 用例） |
-| `DebouncerTest` | `Debouncer` | 正常执行、去抖去重、异常不阻断、shutdown 行为（6 用例） |
-| `DebouncerConcurrencyTest` | `Debouncer` 并发 | 不同 key 并行、同 key 去重、单线程池退化（3 用例） |
-| `MetadataCollectorTest` | `MetadataCollector` | 空检查、占位符解析、反向索引正确性、重复构建保护（9 用例） |
-| `ConditionalRefreshScopeTest` | `ConditionalRefreshScope` | 常量验证、不存在 Bean、空/null 名称、惰性重建（7 用例） |
-| `ListenerContextTest` | `ListenerContext` | 委托行为、单 key 影响、未监听 key、快照原子替换（7 用例） |
-| `ConditionalRefreshListenerTest` | `ConditionalRefreshListener` | 监听器注册、配置变更触发、全局开关、close 释放（5 用例） |
-| `ConditionalRefreshEndToEndTest` | 集成测试（Mock） | 7 个场景全覆盖（Mock Nacos + 可变 PropertySource） |
-| `ConditionalRefreshE2ETest` | 端到端测试（真实 Nacos） | 7 个场景、真实 `ConfigService.publishConfig()` 推送 |
+### 单元测试（starter 模块）
+
+| 测试类 | 覆盖什么 | 关键场景 |
+|--------|----------|----------|
+| `ConfigDiffUtilsTest` | 配置解析与 diff | Properties/YAML 解析、diff 语义、空配置边界 |
+| `DebouncerTest` | 去抖器基础 | 正常执行、去抖去重、异常不阻断、shutdown 行为 |
+| `DebouncerConcurrencyTest` | 去抖器并发 | 不同 key 并行、同 key 去重、单线程池退化 |
+| `MetadataCollectorTest` | 元数据收集 | 空检查、占位符解析、反向索引正确性、双索引 prefix 模式 |
+| `ConditionalRefreshScopeTest` | 作用域生命周期 | 常量验证、不存在 Bean、空/null 名称、惰性重建、scopedTarget 前缀 |
+| `ConditionalRefreshListenerTest` | 监听器基础 | 监听器注册、配置开关、close 释放 |
+| `ConditionalRefreshListenerRefreshEventTest` | 事件驱动逻辑 | 精确匹配、前缀匹配、混合模式、空变更跳过、fallback 全量刷新、开关关闭 |
+
+### 集成测试（test-sample 模块）
+
+| 测试类 | 覆盖什么 | 关键场景 |
+|--------|----------|----------|
+| `ConditionalRefreshSampleTest` | 真实 Nacos 端到端 | Context 加载、索引构建、精准刷新、多组独立、destroyMethod |
 
 ---
 
-## 七、扩展点速查
+## 附录 A：常见调试日志速查
+
+| 日志级别 | 消息模式 | 含义 |
+|----------|----------|------|
+| INFO | `Custom scope 'conditionalRefresh' registered...` | 作用域注册成功 |
+| INFO | `Conditional refresh auto-configuration activated...` | 自动配置已启用 |
+| INFO | `Conditional refresh listeners initialized...` | 监听器初始化完成 |
+| INFO | `Environment changed, keys: [...]` | 检测到配置变更 |
+| INFO | `Affected beans for changed keys ...: [...]` | 定位到受影响 Bean |
+| INFO | `Bean '...' destroyed in conditional refresh scope.` | 旧实例已销毁 |
+| WARN | `Key '...' not found in current Environment` | 注解引用的 key 不存在 |
+| DEBUG | `Bean '...' registered for conditional refresh` | 单个 Bean 被扫描并改写 |
+| DEBUG | `Affected beans for changed keys [...]` | 受影响 Beans 详情 |
+| ERROR | `Failed to refresh bean '...'` | 刷新过程异常 |
+
+## 附录 B：扩展点速查
 
 | 需求 | 扩展方式 |
 |------|----------|
@@ -464,24 +849,42 @@ Spring Boot 启动
 | 调整去抖窗口 | `conditional.refresh.debounce.delay: 1000` |
 | 自定义监控指标 | 注入 `MeterRegistry`，Micrometer 会自动集成 |
 
+## 附录 C：文件结构总览
+
+```
+conditional-refresh-spring-boot-starter/
+├── src/main/java/com/liu/conditionalrefresh/
+│   ├── annotation/
+│   │   └── RefreshOnKeys.java              ← 注解定义（第 1 步）
+│   ├── config/
+│   │   ├── ConditionalRefreshAutoConfiguration.java  ← 自动配置（第 3 步）
+│   │   └── ConditionalRefreshProperties.java         ← 配置绑定（第 2 步）
+│   ├── processor/
+│   │   ├── MetadataCollector.java           ← 元数据收集器（第 6 步）
+│   │   └── RefreshOnKeysPostProcessor.java  ← 后处理器（第 5 步）
+│   ├── scope/
+│   │   ├── ConditionalRefreshScope.java     ← 作用域实现（第 4 步）
+│   │   └── ConditionalScopeRegistrar.java   ← 作用域注册器（第 4 步）
+│   ├── listener/
+│   │   ├── ConditionalRefreshListener.java  ← 核心监听器（第 7 步）
+│   │   ├── Debouncer.java                   ← 去抖器（第 8 步）
+│   │   └── ConfigDiffUtils.java             ← 配置解析（第 9 步，已非主链路）
+│   └── exception/
+│       └── RefreshFailedException.java      ← @Deprecated 预留
+└── src/test/java/.../
+    ├── ConfigDiffUtilsTest.java
+    ├── DebouncerTest.java
+    ├── DebouncerConcurrencyTest.java
+    ├── MetadataCollectorTest.java
+    ├── ConditionalRefreshScopeTest.java
+    ├── ConditionalRefreshListenerTest.java
+    └── ConditionalRefreshListenerRefreshEventTest.java
+```
+
 ---
 
-## 八、常见调试日志速查
-
-| 日志级别 | 消息模式 | 含义 |
-|----------|----------|------|
-| INFO | `Custom scope 'conditionalRefresh' registered...` | 作用域注册成功 |
-| INFO | `Conditional refresh auto-configuration activated...` | 自动配置已启用 |
-| INFO | `Registered Nacos listener for dataId=...` | 监听器注册成功 |
-| INFO | `Config changed for dataId=...: [keys]` | 检测到配置变更 |
-| INFO | `Affected beans for changed keys ...` | 定位到受影响 Bean |
-| WARN | `Key '...' not found in current Environment` | 注解引用的 key 不存在（可能后续引入） |
-| WARN | `YAML parsing failed, falling back to Properties...` | 格式解析降级 |
-| WARN | `Failed to fetch initial snapshot...` | 初始快照获取失败 |
-| DEBUG | `Bean '...' registered for conditional refresh` | 单个 Bean 被扫描并改写 |
-| ERROR | `Failed to register Nacos listener...` | 监听器注册异常 |
-| ERROR | `Failed to refresh bean '...'` | 刷新过程异常 |
-
----
-
-> **阅读建议**：按本指南顺序阅读源码，每步先理解数据结构和调用方向，再关注异常处理与并发控制细节。
+> **阅读建议**：
+> 1. 先通读本文档，建立整体认知
+> 2. 按第 5 节的顺序阅读源码，每步先理解"这个组件解决什么问题"，再关注实现细节
+> 3. 结合 Javadoc 和代码注释理解关键方法
+> 4. 最后跑一遍单元测试，用断点跟踪完整链路

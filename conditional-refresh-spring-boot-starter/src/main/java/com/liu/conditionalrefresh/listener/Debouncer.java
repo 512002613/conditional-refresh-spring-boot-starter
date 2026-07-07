@@ -14,22 +14,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 不立即执行刷新，而是等待一个静默窗口。若窗口内有新的变更通知，
  * 则取消前一次调度、重新计时。只有在窗口内没有新通知时，才会真正执行刷新。
  *
- * <h3>为什么需要去抖？</h3>
+ * <h2>为什么需要去抖？</h2>
  * <ul>
  *     <li>Nacos 配置推送可能存在"通知风暴"（同一配置在短时间内多次推送）。</li>
  *     <li>同一 Key 的变更可能触发多个监听路径，导致重复刷新。</li>
  *     <li>频繁地对带连接池的 Bean 执行 {@code destroy + create} 会造成资源泄漏。</li>
  * </ul>
  *
- * <h3>线程模型</h3>
+ * <h2>线程模型</h2>
  * <p>使用<strong>固定大小线程池</strong>（默认大小 = CPU 核心数），而非单线程调度器。
  * 这样不同 Bean 的刷新任务可以在不同线程中<strong>并行执行</strong>，
  * 而同一 Bean 的并发控制由上层 {@link java.util.concurrent.locks.ReentrantLock} 保证，
  * 避免与 Bean 级锁产生两层串行化的设计冲突。
  *
- * <h3>线程安全性</h3>
+ * <h2>线程安全性</h2>
  * <p>{@link #pending} 使用 {@link ConcurrentHashMap}，调度过程中若
- * {@link #shutdown()} 被调用，未执行的任务将被取消。
+ * {@link #close()} 被调用，未执行的任务将被取消。
  *
  * @author conditional-refresh
  * @since 1.0.0

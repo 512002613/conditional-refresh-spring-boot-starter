@@ -5,52 +5,101 @@ import com.alibaba.nacos.api.config.ConfigService;
 import com.liu.conditionalrefresh.annotation.RefreshOnKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.env.Environment;
 
 /**
  * Spring Boot 3.5.x 测试验证模块的示例 Bean 配置。
+ *
+ * <p>演示两种 {@code @RefreshOnKeys} 用法：
+ * <ul>
+ *     <li>精确模式：{@code @RefreshOnKeys({"channel.sign.secret", "channel.sign.token"})}</li>
+ *     <li>前缀模式：{@code @RefreshOnKeys(prefix = "template")} — 注入整个 {@code @ConfigurationProperties} Bean</li>
+ * </ul>
  */
 @Configuration
+@EnableConfigurationProperties({TestV3Beans.ChannelSignProperties.class,
+        TestV3Beans.TemplateProperties.class, TestV3Beans.FeatureProperties.class})
 public class TestV3Beans {
 
     private static final Logger log = LoggerFactory.getLogger(TestV3Beans.class);
 
+    /**
+     * 精确模式：监听 channel.sign.secret 和 channel.sign.token。
+     */
     @Bean(destroyMethod = "destroy")
     @RefreshOnKeys({"channel.sign.secret", "channel.sign.token"})
-    public ChannelSignService channelSignService(Environment env) {
-        String secret = env.getProperty("channel.sign.secret", "");
-        String token = env.getProperty("channel.sign.token", "");
-        log.info("[V3] ChannelSignService 初始化, secret={}, token={}", secret, token);
-        return new ChannelSignService(secret, token);
+    public ChannelSignService channelSignService(ChannelSignProperties props) {
+        log.info("[V3] ChannelSignService 初始化, secret={}, token={}",
+                props.getSecret(), props.getToken());
+        return new ChannelSignService(props.getSecret(), props.getToken());
     }
 
+    /**
+     * 前缀模式：监听所有以 "template." 开头的 key，注入整个 Properties Bean。
+     */
     @Bean(destroyMethod = "destroy")
-    @RefreshOnKeys({"template.max.retry", "template.timeout"})
-    public TemplateService templateService(Environment env) {
-        int maxRetry = Integer.parseInt(env.getProperty("template.max.retry", "3"));
-        long timeout = Long.parseLong(env.getProperty("template.timeout", "5000"));
-        log.info("[V3] TemplateService 初始化, maxRetry={}, timeout={}", maxRetry, timeout);
-        return new TemplateService(maxRetry, timeout);
+    @RefreshOnKeys(prefix = "template")
+    public TemplateService templateService(TemplateProperties props) {
+        log.info("[V3] TemplateService 初始化, maxRetry={}, timeout={}",
+                props.getMaxRetry(), props.getTimeout());
+        return new TemplateService(props.getMaxRetry(), props.getTimeout());
     }
 
-    @Bean
-    public ConfigService configService(NacosConfigManager nacosConfigManager) {
-        return nacosConfigManager.getConfigService();
-    }
-
+    /**
+     * 精确模式 + 显式 dataId/group。
+     */
     @Bean(destroyMethod = "destroy")
     @RefreshOnKeys(
             value = {"custom.feature.enabled"},
             dataId = "conditional-refresh-test-sample-v3",
             group = "DEFAULT_GROUP"
     )
-    public FeatureToggleService featureToggleService(Environment env) {
-        boolean enabled = Boolean.parseBoolean(
-                env.getProperty("custom.feature.enabled", "false"));
-        log.info("[V3] FeatureToggleService 初始化, enabled={}", enabled);
-        return new FeatureToggleService(enabled);
+    public FeatureToggleService featureToggleService(FeatureProperties props) {
+        log.info("[V3] FeatureToggleService 初始化, enabled={}", props.getEnabled());
+        return new FeatureToggleService(props.getEnabled());
+    }
+
+    /**
+     * 暴露 {@link ConfigService} 供集成测试发布配置。
+     */
+    @Bean
+    public ConfigService configService(NacosConfigManager nacosConfigManager) {
+        return nacosConfigManager.getConfigService();
+    }
+
+    // ─── @ConfigurationProperties 绑定类 ─────────────────────────────
+
+    @ConfigurationProperties(prefix = "channel.sign")
+    public static class ChannelSignProperties {
+        private String secret = "";
+        private String token = "";
+
+        public String getSecret() { return secret; }
+        public void setSecret(String secret) { this.secret = secret; }
+        public String getToken() { return token; }
+        public void setToken(String token) { this.token = token; }
+    }
+
+    @ConfigurationProperties(prefix = "template")
+    public static class TemplateProperties {
+        private int maxRetry = 3;
+        private long timeout = 5000L;
+
+        public int getMaxRetry() { return maxRetry; }
+        public void setMaxRetry(int maxRetry) { this.maxRetry = maxRetry; }
+        public long getTimeout() { return timeout; }
+        public void setTimeout(long timeout) { this.timeout = timeout; }
+    }
+
+    @ConfigurationProperties(prefix = "custom.feature")
+    public static class FeatureProperties {
+        private boolean enabled = false;
+
+        public boolean getEnabled() { return enabled; }
+        public void setEnabled(boolean enabled) { this.enabled = enabled; }
     }
 
     // ─── 内部服务类 ──────────────────────────────────────────────────

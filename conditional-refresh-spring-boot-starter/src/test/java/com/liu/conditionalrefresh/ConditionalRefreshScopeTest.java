@@ -16,9 +16,9 @@ import static org.junit.jupiter.api.Assertions.*;
  * <ul>
  *     <li>正常刷新：旧实例被销毁，返回 {@code true}</li>
  *     <li>惰性重建：销毁后新实例尚未创建，下次访问触发 {@link org.springframework.beans.factory.ObjectFactory}</li>
- *     <li>不存在的 Bean：返回 {@code false}</li>
+ *     <li>不存在的 Bean：返回 {@code true}（配置变更下次访问生效）</li>
  *     <li>空名称：抛出 {@link IllegalArgumentException}</li>
- *     <li>destroyMethod 异常：不阻断流程</li>
+ *     <li>连续刷新：第一次销毁旧实例，第二次仍返回 {@code true}</li>
  * </ul>
  */
 class ConditionalRefreshScopeTest {
@@ -28,6 +28,8 @@ class ConditionalRefreshScopeTest {
     @BeforeEach
     void setUp() {
         scope = new ConditionalRefreshScope();
+        // 清理 survivor cache，避免测试间相互污染
+        ConditionalRefreshScope.survivorCacheClear();
     }
 
     @Test
@@ -43,10 +45,11 @@ class ConditionalRefreshScopeTest {
     }
 
     @Test
-    @DisplayName("刷新不存在的 bean 返回 false")
-    void refresh_nonExistentBean_returnsFalse() {
+    @DisplayName("刷新不存在的 bean 返回 true（配置变更下次访问生效）")
+    void refresh_nonExistentBean_returnsTrue() {
+        // 语义：无缓存实例时，无需销毁，配置变更在下一次 proxy 访问时自动生效
         boolean result = scope.refresh("nonExistentBean");
-        assertFalse(result, "Should return false when bean doesn't exist in scope cache");
+        assertTrue(result, "Should return true — config change will take effect on next proxy access");
     }
 
     @Test
@@ -62,15 +65,17 @@ class ConditionalRefreshScopeTest {
     }
 
     @Test
-    @DisplayName("刷新已存在的 bean 返回 true，且再次刷新返回 false")
-    void refresh_existingBean_thenNotExisting() {
+    @DisplayName("刷新已存在的 bean 返回 true；再次刷新也返回 true（无缓存实例语义）")
+    void refresh_existingBean_thenNotExisting_returnsTrue() {
         // 使用 ObjectFactory 注册一个 bean 到 scope 缓存
+        // 真实场景中 scoped-proxy 使用 "scopedTarget." + beanName 作为缓存 key，
+        // 测试中需模拟此行为以与 refresh() 内部逻辑一致。
         String beanName = "testBean";
+        String targetName = "scopedTarget." + beanName;
         AtomicInteger createCount = new AtomicInteger(0);
 
-        // 通过 put 方法将 bean 放入缓存（模拟 GenericScope 的内部行为）
-        // GenericScope 的 cache 是私有的，我们通过 get → 触发 ObjectFactory → 缓存结果
-        scope.get(beanName, () -> {
+        // 通过 get 触发 ObjectFactory 创建并缓存 bean
+        scope.get(targetName, () -> {
             createCount.incrementAndGet();
             return new Object();
         });
@@ -78,23 +83,27 @@ class ConditionalRefreshScopeTest {
         // 确认已创建
         assertEquals(1, createCount.get(), "Bean should be created on first get()");
 
-        // 刷新 — 销毁旧实例
+        // 第一次刷新 — 销毁旧实例，返回 true
         boolean firstRefresh = scope.refresh(beanName);
         assertTrue(firstRefresh, "Should return true when old instance was destroyed");
 
-        // 再次刷新 — 缓存已空
+        // 第二次刷新 — 缓存已空，但仍返回 true（配置变更下次 proxy 访问生效）
         boolean secondRefresh = scope.refresh(beanName);
-        assertFalse(secondRefresh, "Should return false when bean no longer in scope");
+        assertTrue(secondRefresh,
+                "Should return true even when no cached instance — config change is still effective");
     }
 
     @Test
     @DisplayName("刷新后再次 get 触发惰性重建")
     void refresh_thenGet_triggersLazyRecreation() {
+        // 真实场景中 scoped-proxy 使用 "scopedTarget." + beanName 作为缓存 key，
+        // 测试中需模拟此行为以与 refresh() 内部逻辑一致。
         String beanName = "lazyBean";
+        String targetName = "scopedTarget." + beanName;
         AtomicInteger createCount = new AtomicInteger(0);
 
         // 首次创建
-        scope.get(beanName, () -> {
+        scope.get(targetName, () -> {
             createCount.incrementAndGet();
             return new Object();
         });
@@ -104,7 +113,7 @@ class ConditionalRefreshScopeTest {
         scope.refresh(beanName);
 
         // 再次 get — 应触发重新创建
-        Object newInstance = scope.get(beanName, () -> {
+        Object newInstance = scope.get(targetName, () -> {
             createCount.incrementAndGet();
             return new Object();
         });

@@ -9,37 +9,63 @@ import java.lang.annotation.*;
  * 该 Bean 才会被销毁并重建。未列出的 Key 变更不会影响该 Bean，
  * 从而实现"配置变更影响最小化"。
  *
- * <h3>适用范围</h3>
+ * <h2>两种监听模式（互斥，必选其一）</h2>
+ * <ul>
+ *   <li><strong>精确模式</strong>（{@link #value()}）：显式列出每个监听的 key，
+ *       仅当列出的 key 值变更时触发刷新。</li>
+ *   <li><strong>前缀模式</strong>（{@link #prefix()}）：监听该前缀下的所有 key，
+ *       任何以 {@code prefix.} 开头的 key 变更都会触发刷新。
+ *       适用于工厂方法注入整个 {@code @ConfigurationProperties} Bean 的场景。</li>
+ * </ul>
+ *
+ * <h2>适用范围</h2>
  * <ul>
  *   <li><strong>类级别</strong>：作用于 {@code @Component}、{@code @Service} 等类。</li>
  *   <li><strong>方法级别</strong>：作用于 {@code @Configuration} 类中的 {@code @Bean} 方法。</li>
  * </ul>
  *
- * <h3>使用示例</h3>
- * <pre>{@code
- * @Configuration
+ * <h2>使用示例 — 精确模式</h2>
+ * <pre>
+ * &#64;Configuration
  * public class CosConfig {
  *
- *     @Bean(destroyMethod = "shutdown")
- *     @RefreshOnKeys({"cos.tencent.secretId", "cos.tencent.secretKey"})
- *     public COSClient cosClient(Environment env) {
- *         String id  = env.getProperty("cos.tencent.secretId");
- *         String key = env.getProperty("cos.tencent.secretKey");
+ *     &#64;Bean(destroyMethod = "shutdown")
+ *     &#64;RefreshOnKeys({"cos.tencent.secretId", "cos.tencent.secretKey"})
+ *     public COSClient cosClient(&#64;Value("${cos.tencent.secretId}") String id,
+ *                                &#64;Value("${cos.tencent.secretKey}") String key) {
  *         return new COSClient(id, key);
  *     }
  * }
- * }</pre>
+ * </pre>
  *
- * <p>以上 Bean 仅当 {@code cos.tencent.secretId} 或 {@code cos.tencent.secretKey}
- * 的 <em>值</em> 发生变化时才会重建，其他配置变更（如 {@code sms.sign.name}）不会触发。
+ * <h2>使用示例 — 前缀模式（注入 @ConfigurationProperties）</h2>
+ * <pre>
+ * &#64;ConfigurationProperties(prefix = "channel.sign")
+ * public class ChannelSignProperties {
+ *     private String secret;
+ *     private String token;
+ *     // getters/setters
+ * }
  *
- * <h3>与 {@code @RefreshScope} 的关系</h3>
+ * &#64;Configuration
+ * public class ChannelConfig {
+ *     &#64;Bean(destroyMethod = "destroy")
+ *     &#64;RefreshOnKeys(prefix = "channel.sign")
+ *     public ChannelSignService channelSignService(ChannelSignProperties props) {
+ *         return new ChannelSignService(props.getSecret(), props.getToken());
+ *     }
+ * }
+ * </pre>
+ *
+ * <p>前缀模式下，任何 {@code channel.sign.*} 下的 key 变更都会触发该 Bean 刷新。
+ *
+ * <h2>与 {@code @RefreshScope} 的关系</h2>
  * <p>标记 {@code @RefreshOnKeys} 的 Bean <strong>不得同时</strong>使用 {@code @RefreshScope}。
  * 启动时若检测到混用，将直接抛出异常，避免不可预期的刷新行为。
  *
- * <h3>占位符支持</h3>
- * <p>{@link #value()}、{@link #dataId()}、{@link #group()} 均支持 {@code ${...}} 占位符，
- * 在应用启动、环境就绪后统一解析。
+ * <h2>占位符支持</h2>
+ * <p>{@link #value()}、{@link #prefix()}、{@link #dataId()}、{@link #group()}
+ * 均支持 {@code ${...}} 占位符，在应用启动、环境就绪后统一解析。
  *
  * <p><strong>注意</strong>：该注解 <em>不包含</em> {@code @Scope} 语义，作用域设置由
  * {@link com.liu.conditionalrefresh.processor.RefreshOnKeysPostProcessor}
@@ -58,11 +84,27 @@ public @interface RefreshOnKeys {
     /**
      * 需要监听的配置键列表（完整的 property key，如 {@code "cos.tencent.secretId"}）。
      *
+     * <p>与 {@link #prefix()} <strong>互斥</strong>：两者不能同时非空，也不能同时为空。
+     *
      * <p>支持 {@code ${...}} 占位符，在环境就绪后统一解析。
      *
-     * @return 配置的键名数组（不能为空）
+     * @return 配置的键名数组
      */
-    String[] value();
+    String[] value() default {};
+
+    /**
+     * 需要监听的配置前缀（如 {@code "channel.sign"}）。
+     *
+     * <p>与 {@link #value()} <strong>互斥</strong>：两者不能同时非空，也不能同时为空。
+     *
+     * <p>前缀模式下，任何以 {@code prefix + "."} 开头的 key 变更都会触发该 Bean 刷新。
+     * 适用于工厂方法注入整个 {@code @ConfigurationProperties} Bean 的场景。
+     *
+     * <p>支持 {@code ${...}} 占位符，在环境就绪后统一解析。
+     *
+     * @return 配置前缀
+     */
+    String prefix() default "";
 
     /**
      * 对应的 Nacos Data ID。
@@ -84,7 +126,7 @@ public @interface RefreshOnKeys {
      *
      * <p>默认值为空字符串，将在环境就绪后解析为：
      * <ol>
-     *     <li>{@code spring.cloud.nacs.config.group}（如果配置）</li>
+     *     <li>{@code spring.cloud.nacos.config.group}（如果配置）</li>
      *     <li>{@code DEFAULT_GROUP}（兜底）</li>
      * </ol>
      *

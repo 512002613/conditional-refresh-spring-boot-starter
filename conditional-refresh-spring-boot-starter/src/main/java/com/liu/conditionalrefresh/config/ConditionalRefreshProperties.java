@@ -7,7 +7,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *
  * <p>通过 {@link ConfigurationProperties} 绑定 {@code conditional.refresh.} 前缀的配置项。
  *
- * <h3>配置示例</h3>
+ * <h2>配置示例</h2>
  * <pre>{@code
  * # application.yml
  * conditional:

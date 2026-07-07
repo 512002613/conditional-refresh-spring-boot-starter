@@ -2,6 +2,12 @@
 
 本文件为 Claude Code (claude.ai/code) 提供本仓库的代码工作指引。
 
+## 会话启动必读
+
+每次新会话开始时，**必须首先读取 [`.claude-session-history.md`](./.claude-session-history.md)**。该文件记录了项目的完整开发历程、架构决策、踩坑经验和技术债务，不在 VCS 控制中（已加入 .gitignore），是跨会话恢复上下文的核心文档。
+
+当用户发送"压缩历史"或"更新会话历史"指令时，应根据当前会话的实际进展**更新该文档**（追加或修正内容），确保其始终反映项目最新状态。
+
 ## 提交信息规范
 
 **禁止**在提交信息中添加 `Co-Authored-By` 行（包括 `Co-Authored-By: Claude <noreply@anthropic.com>` 或任何变体）。本仓库的所有提交**仅保留真实人类贡献者信息**，不要写入任何 AI 协作者 trailer。
@@ -69,7 +75,8 @@ BUILD SUCCESS
 ```
 conditional-refresh-spring-boot-starter-parent/   ← 父 POM（聚合构建）
 ├── conditional-refresh-spring-boot-starter/      ← starter 核心模块（jar）
-├── conditional-refresh-test-sample/              ← SB2.7 测试验证模块（可运行应用 + JUnit）
+├── conditional-refresh-test-sample/              ← SB2.7 + SC2021.0.8 测试验证模块
+├── conditional-refresh-test-sample-v2/           ← SB2.7 + SC2022.0.5 测试验证模块（独立项目）
 ├── conditional-refresh-test-sample-v3/           ← SB3.5 测试验证模块（独立项目）
 └── conditional-refresh-test-sample-v4/           ← SB4.0 测试验证模块（独立项目）
 ```
@@ -80,6 +87,7 @@ conditional-refresh-spring-boot-starter-parent/   ← 父 POM（聚合构建）
 |------|-------------|--------------|---------------------|------|
 | starter | 2.7.18 | 2021.0.8 | 2021.0.5.0 | 1.8 |
 | test-sample | 2.7.18 | 2021.0.8 | 2021.0.5.0 | 1.8 |
+| test-sample-v2 | 2.7.18 | 2022.0.5 | 2022.0.0.0 | 1.8 |
 | test-sample-v3 | 3.5.x | 2023.0.x | 2023.0.3.0 | 17 |
 | test-sample-v4 | 4.0.x | 2023.0.x | 2023.0.3.0 | 17 |
 
@@ -96,6 +104,9 @@ conditional-refresh-spring-boot-starter-parent/   ← 父 POM（聚合构建）
 ```bash
 # 完整构建（编译 + 测试 + 打包，所有模块）
 cd /d/devworkspace/conditional-refresh-spring-boot-starter && mvn clean package
+
+# 构建 v2 测试模块（独立项目，不继承父 POM）
+mvn clean package -pl conditional-refresh-test-sample-v2
 
 # 跳过测试
 mvn clean package -DskipTests
@@ -133,7 +144,7 @@ com.liu.conditionalrefresh
 ├── config/           → 自动配置 + 属性绑定
 ├── processor/        → Bean 定义扫描 + 元数据收集
 ├── scope/            → 自定义作用域生命周期（GenericScope 扩展）
-├── listener/         → Nacos 回调 → diff → 去抖刷新
+├── listener/         → EnvironmentChangeEvent → 反向索引 → 去抖刷新
 └── exception/        → RefreshFailedException（@Deprecated，预留）
 ```
 
@@ -144,56 +155,59 @@ com.liu.conditionalrefresh
     │
     ▼（BeanDefinitionRegistryPostProcessor 阶段）
 RefreshOnKeysPostProcessor
-  ├─ 改写：scope="conditionalRefresh"，proxyMode=TARGET_CLASS（通过反射）
-  ├─ 校验：同一 Bean 不得同时标注 @RefreshScope
+  ├─ 改写：scope="conditionalRefresh"，创建 CGLIB scoped-proxy
+  ├─ 校验：value/prefix 互斥；不得同时标注 @RefreshScope
   └─ 收集原始元数据 → MetadataCollector
     │
     ▼（Bean 实例化）
 Bean 以 scoped-proxy 形式创建（惰性 —— 仅在首次访问时实例化）
     │
     ▼（ApplicationReadyEvent）
-ConditionalRefreshListener.onApplicationEvent()
-  ├─ MetadataCollector.buildCommittedIndex(env)
-  │    ├─ 解析 keys/dataId/group 中的 ${...} 占位符
-  │    ├─ 回退规则：dataId → spring.application.name，group → DEFAULT_GROUP
-  │    └─ 构建反向索引：dataId → group → (key → Set<beanName>)
-  ├─ 按 (dataId, group) 获取初始配置快照（避免首次推送触发全量刷新）
-  └─ 按 (dataId, group) 注册 Nacos Listener
+ConditionalRefreshListener.onApplicationReady()
+  └─ MetadataCollector.buildCommittedIndex(env)
+       ├─ 解析 keys/dataId/group/prefix 中的 ${...} 占位符
+       ├─ 回退规则：dataId → spring.application.name，group → DEFAULT_GROUP
+       └─ 构建双索引：dataId → group → IndexEntry(keyToBeanNames + prefixToBeanNames)
     │
-    ▼（Nacos 推送 → receiveConfigInfo）
-ConditionalRefreshListener.handleChange()
-  ├─ ConfigDiffUtils.parse(newConfig) → 新快照 Map
-  ├─ 原子替换快照 + 获取旧快照
-  ├─ ConfigDiffUtils.diff(old, new) → 变更的 keys（忽略删除）
-  ├─ ListenerContext.findAffectedBeans(changedKeys) → 受影响的 bean 名称集合
-  │    └─ 委托给 MetadataCollector.IndexEntry.findAffectedBeans()
+    ▼（Nacos 推送 → PropertySource 更新 → EnvironmentChangeEvent）
+ConditionalRefreshListener.onEnvironmentChanged()  ← 主路径（SC 2022.0.x+）
+  ├─ event.getKeys() 获取变更 keys
+  ├─ IndexEntry.findAffectedBeans(changedKeys) → 受影响的 bean 名称集合
+  │    ├─ 精确匹配：changedKey 存在于 keyToBeanNames
+  │    └─ 前缀匹配：changedKey.startsWith(prefix + ".")
   └─ 按 bean：Debouncer.debounce(beanName, refreshTask)
        │（去抖窗口后，在线程池中执行）
        ▼
-  ConditionalRefreshScope.refresh(beanName)
+  ConditionalRefreshListener.refreshBean(beanName)
     ├─ ReentrantLock.lock()（按 bean 粒度）
-    ├─ super.remove() → 触发 destroyMethod
-    └─ 新实例在下次代理访问时惰性创建
-       （成功指标 = "旧实例已销毁"，而非"新实例已创建"）
+    ├─ scope.refresh(beanName) 仅销毁旧实例（新实例惰性创建）
+    └─ recordSuccess / recordFailure（Micrometer）
+    │
+    ▼（SC 2021.0.x fallback — RefreshScopeRefreshedEvent）
+ConditionalRefreshListener.onRefreshScopeRefreshed()
+  └─ 全量刷新所有 @RefreshOnKeys Bean（无法获取 changedKeys 的降级方案）
 ```
 
 ### 核心组件
 
-**`@RefreshOnKeys`** — 注解，`String[] value()`（必填，监听的 keys），可选 `dataId()` 和 `group()`（均为空时自动解析）。不含 `@Scope`，作用域通过编程方式设置。
+**`@RefreshOnKeys`** — 注解，两种互斥模式：`String[] value()`（精确模式，显式列出监听的 keys）或 `String prefix()`（前缀模式，监听 `prefix.*`），可选 `dataId()` 和 `group()`（均为空时自动解析）。不含 `@Scope`，作用域通过编程方式设置。
 
-**`RefreshOnKeysPostProcessor`**（BDRPP）— 在 Bean 定义注册后处理阶段扫描所有 Bean 定义。通过反射直接设置 `AbstractBeanDefinition` 的 `proxyMode` 字段（兼容 Spring 5.x 中 `setProxyMode` 可能不可访问的场景）。Order = `HIGHEST_PRECEDENCE + 10`。
+**`RefreshOnKeysPostProcessor`**（BDRPP）— 在 Bean 定义注册后处理阶段扫描所有 Bean 定义。通过 `ScopedProxyCreator.createScopedProxy()` 显式创建 CGLIB scoped-proxy。Order = `HIGHEST_PRECEDENCE + 10`。
 
-**`MetadataCollector`** — 两阶段数据结构：BDRPP 阶段收集原始数据，`ApplicationReadyEvent` 时一次性构建提交索引。使用 `ConcurrentHashMap` 保证线程安全，`volatile committedIndex` 保证安全发布。内部类：`DataGroupKey`（不可变的 (dataId, group) 对）、`IndexEntry`（含 `findAffectedBeans()` 的反向索引）。
+**`MetadataCollector`** — 两阶段数据结构：BDRPP 阶段收集原始数据，`ApplicationReadyEvent` 时一次性构建提交索引。使用 `ConcurrentHashMap` 保证线程安全，`volatile committedIndex` 保证安全发布。内部类：`DataGroupKey`（不可变的 (dataId, group) 对）、`IndexEntry`（含 `keyToBeanNames` + `prefixToBeanNames` 双索引）。
 
-**`ConditionalRefreshScope`** — 扩展 Spring Cloud 的 `GenericScope`，名称为 `"conditionalRefresh"`。`refresh()` 仅销毁旧实例；新实例在下次 scoped-proxy 访问时惰性创建。`destroyMethod` 异常被吞掉（仅 warn 日志，不传播）。**返回值 `true` 表示"旧实例已销毁"，而非"新实例已创建"。**
+**`ConditionalRefreshScope`** — 扩展 Spring Cloud 的 `GenericScope`，名称为 `"conditionalRefresh"`。`refresh()` 仅销毁旧实例（通过 `"scopedTarget." + beanName` 定位缓存）；新实例在下次 scoped-proxy 访问时惰性创建。**返回值 `true` 表示"配置变更已生效"（旧实例已销毁，或无需销毁）。** 含 survivor cache 支持跨 context restart 场景。
 
-**`ConditionalRefreshListener`** — 编排完整流水线。使用按 bean 粒度的 `ReentrantLock`（不同 bean 并行刷新，同一 bean 串行）。通过 `Metrics.globalRegistry` 集成 Micrometer（可选 — 无硬依赖）。`recordSuccess` 在旧实例销毁后调用（而非新实例创建后）。
+**`ConditionalRefreshListener`** — 实现 `SmartApplicationListener` + `Ordered`，双事件监听：
+- `EnvironmentChangeEvent`（主路径）— PropertySource 更新后发布，携带 changedKeys，精准刷新
+- `RefreshScopeRefreshedEvent`（fallback）— SC 2021.0.x 全量 restart 后触发，全量刷新所有 @RefreshOnKeys Bean
+- `getOrder()` 返回 `Ordered.LOWEST_PRECEDENCE`，确保在 `ConfigurationPropertiesRebinder` 之后执行
 
-**`Debouncer`** — 按 (dataId, group) 独立的 `ScheduledExecutorService`，固定线程池（默认 = `max(2, CPU 核心数)`）。允许不同 bean 并行刷新，同一 bean 并发由外层 `ReentrantLock` 控制。默认去抖窗口 500ms，可通过 `conditional.refresh.debounce.delay` 配置。
+使用按 bean 粒度的 `ReentrantLock`（不同 bean 并行刷新，同一 bean 串行）。通过 `Metrics.globalRegistry` 集成 Micrometer（可选 — 无硬依赖）。
 
-**`ListenerContext`** — 持有 `AtomicReference<Map>` 用于配置快照（Nacos 回调中安全地原子读写），将 `findAffectedBeans()` 委托给 `MetadataCollector.IndexEntry`，并拥有一个 `Debouncer`。
+**`Debouncer`** — 全局单一 `ScheduledExecutorService`（默认线程池 = `max(2, CPU 核心数)`）。允许多个 Bean 并行刷新，同一 Bean 并发由外层 `ReentrantLock` 控制。默认去抖窗口 500ms，可通过 `conditional.refresh.debounce.delay` 配置。
 
-**`ConfigDiffUtils`** — 同时解析 Properties 和 YAML 格式（启发式规则：含 `:` 且不以 `[` 开头 → YAML）。YAML 解析失败时回退到 Properties。`diff()` 将 key 删除视为无变更，以减少不必要的刷新。
+**`ConfigDiffUtils`** — 同时解析 Properties 和 YAML 格式（启发式规则：含 `:` 且不以 `[` 开头 → YAML）。YAML 解析失败时回退到 Properties。`diff()` 将 key 删除视为无变更，以减少不必要的刷新。注意：当前架构下此类仅作为工具保留，不再在主链路中使用（因为框架不再直接处理 Nacos 推送）。
 
 **`RefreshFailedException`** — `@Deprecated`，预留。当前框架使用日志 + Micrometer 指标替代刷新失败时的异常抛出。
 
@@ -214,7 +228,7 @@ ConditionalRefreshListener.handleChange()
 | `enabled` | `true` | 总开关 |
 | `debounce.delay` | `500` ms | 去抖窗口 |
 | `metrics-enabled` | `true` | 是否暴露 Micrometer 计数器 |
-| `initial-snapshot-enabled` | `true` | 注册监听器前先获取快照 |
+| `initial-snapshot-enabled` | `true` | 注册监听器前先获取快照（旧版兼容属性，当前未使用） |
 
 ### Spring Boot 版本兼容性
 
@@ -228,10 +242,9 @@ ConditionalRefreshListener.handleChange()
 
 | 机制 | 用途 |
 |------|------|
-| `AtomicReference<Map>`（快照） | Nacos 回调中安全地原子读写旧/新快照 |
-| `ConcurrentHashMap`（contexts, beanLocks） | 线程安全的惰性初始化 |
+| `ConcurrentHashMap`（beanLocks） | Bean 级锁的线程安全惰性初始化 |
 | `ReentrantLock` per bean | 同一 bean 串行，不同 bean 并行 |
-| `Debouncer` per (dataId, group) | 抑制快速重复刷新触发；线程池支持并行执行 |
+| `Debouncer`（全局单一） | 抑制快速重复刷新触发；线程池支持并行执行 |
 | `volatile committedIndex` | 构建完成的索引的安全发布 |
 
 ### Micrometer 指标（可选，无硬 classpath 依赖）
@@ -249,10 +262,10 @@ ConditionalRefreshListener.handleChange()
 | `ConfigDiffUtilsTest` | `ConfigDiffUtils` | 11（parse、diff、e2e、blank） |
 | `DebouncerTest` | `Debouncer` | 6（dedup、exception、shutdown） |
 | `DebouncerConcurrencyTest` | `Debouncer` 并发 | 3（parallel、dedup、single-thread） |
-| `MetadataCollectorTest` | `MetadataCollector` | 9（index、fallback、placeholder） |
+| `MetadataCollectorTest` | `MetadataCollector` | 13（index、fallback、placeholder、prefix 双索引） |
 | `ConditionalRefreshScopeTest` | `ConditionalRefreshScope` | 7（destroy、lazy recreate、edge cases） |
-| `ListenerContextTest` | `ListenerContext` | 7（delegation、snapshot、unmodifiable） |
 | `ConditionalRefreshListenerTest` | `ConditionalRefreshListener` | 5（register、disable、close） |
+| `ConditionalRefreshListenerRefreshEventTest` | `ConditionalRefreshListener` 事件驱动 | 8（精确 + 前缀 + 混合 + fallback + 开关） |
 
 #### test-sample 模块集成测试（位于 `conditional-refresh-test-sample/src/test/`）
 

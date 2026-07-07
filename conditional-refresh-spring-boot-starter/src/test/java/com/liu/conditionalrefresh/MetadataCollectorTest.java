@@ -136,6 +136,70 @@ class MetadataCollectorTest {
                 collector.buildCommittedIndex(env));
     }
 
+    @Test
+    @DisplayName("前缀模式：prefix 正确构建到 prefixToBeanNames")
+    void buildCommittedIndex_prefixMode_buildsPrefixIndex() {
+        collector.add("bean1", "dataId1", "group1", new String[]{}, "channel.sign");
+
+        MockEnvironment env = new MockEnvironment();
+        Map<String, Map<String, MetadataCollector.IndexEntry>> index =
+                collector.buildCommittedIndex(env);
+
+        MetadataCollector.IndexEntry entry = index.get("dataId1").get("group1");
+        Set<String> beans = entry.prefixToBeanNames().get("channel.sign");
+        assertNotNull(beans);
+        assertTrue(beans.contains("bean1"));
+    }
+
+    @Test
+    @DisplayName("前缀模式：findAffectedBeans 前缀匹配正确")
+    void findAffectedBeans_prefixMatch_correct() {
+        collector.add("bean1", "dataId1", "group1", new String[]{}, "channel.sign");
+
+        MockEnvironment env = new MockEnvironment();
+        Map<String, Map<String, MetadataCollector.IndexEntry>> index =
+                collector.buildCommittedIndex(env);
+
+        MetadataCollector.IndexEntry entry = index.get("dataId1").get("group1");
+
+        // channel.sign.secret 匹配 channel.sign 前缀
+        Set<String> affected = entry.findAffectedBeans(Set.of("channel.sign.secret"));
+        assertTrue(affected.contains("bean1"));
+
+        // channel.other 不匹配
+        Set<String> notAffected = entry.findAffectedBeans(Set.of("channel.other"));
+        assertTrue(notAffected.isEmpty());
+    }
+
+    @Test
+    @DisplayName("混合模式：精确 + 前缀同时构建")
+    void buildCommittedIndex_mixedMode_buildsBothIndexes() {
+        collector.add("bean1", "dataId1", "group1", new String[]{"exact.key"});
+        collector.add("bean2", "dataId1", "group1", new String[]{}, "prefix");
+
+        MockEnvironment env = new MockEnvironment();
+        Map<String, Map<String, MetadataCollector.IndexEntry>> index =
+                collector.buildCommittedIndex(env);
+
+        MetadataCollector.IndexEntry entry = index.get("dataId1").get("group1");
+        // 精确索引
+        assertTrue(entry.keyToBeanNames().containsKey("exact.key"));
+        // 前缀索引
+        assertTrue(entry.prefixToBeanNames().containsKey("prefix"));
+    }
+
+    @Test
+    @DisplayName("getAllBeanNames 包含精确和前缀模式的 Bean")
+    void getAllBeanNames_includesBothModes() {
+        collector.add("bean1", "dataId1", "group1", new String[]{"key1"});
+        collector.add("bean2", "dataId1", "group1", new String[]{}, "prefix");
+
+        Set<String> all = collector.getAllBeanNames();
+        assertTrue(all.contains("bean1"));
+        assertTrue(all.contains("bean2"));
+        assertEquals(2, all.size());
+    }
+
     /**
      * 辅助方法：创建包含指定元素的 Set（Java 8 兼容）。
      */

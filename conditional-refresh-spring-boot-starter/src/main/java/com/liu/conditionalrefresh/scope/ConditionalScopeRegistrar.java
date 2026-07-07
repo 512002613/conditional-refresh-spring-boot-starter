@@ -18,7 +18,7 @@ import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
  * 确保 {@code "conditionalRefresh"} 作用域引用的实例与监听器中注入的实例是同一个，
  * 避免刷新操作找不到 Bean 缓存。
  *
- * <h3>作用域语义</h3>
+ * <h2>作用域语义</h2>
  * <p>与原生 {@code "refresh"} 作用域互相独立：
  * <ul>
  *     <li>{@code "refresh"}：Spring Cloud 的 {@code RefreshScope}，
@@ -29,7 +29,7 @@ import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
  *         按条件触发精确刷新。</li>
  * </ul>
  *
- * <h3>注册时机</h3>
+ * <h2>注册时机</h2>
  * <p>通过 {@link BeanFactoryPostProcessor#postProcessBeanFactory} 注册，
  * 确保在 Bean <strong>实例化之前</strong>作用域已被容器识别。
  *

@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: conditional-refresh-test-sample-v2
+
+  # Spring Cloud 2022.0.x 使用新的 ConfigData API 加载远程配置
+  config:
+    import: "nacos:conditional-refresh-test-sample-v2.yaml?group=DEFAULT_GROUP&refresh=true"
+
+  cloud:
+    nacos:
+      config:
+        server-addr: @nacos.server-addr@
+        namespace: @nacos.namespace@
+        group: @nacos.group@
+        file-extension: yaml
+        # 禁用 Nacos 原生 ConfigData 模式，由上方的 spring.config.import 接管
+        # refresh-enabled: true
+
+server:
+  port: 0
+
+logging:
+  level:
+    com.liu.conditionalrefresh: DEBUG

@@ -26,7 +26,7 @@ import org.springframework.core.env.Environment;
  *     <li>{@code conditional.refresh.enabled} 不为 {@code false}。</li>
  * </ul>
  *
- * <h3>注册顺序</h3>
+ * <h2>注册顺序</h2>
  * <ol>
  *     <li>{@link ConditionalRefreshScope} —— 条件刷新作用域 Bean。</li>
  *     <li>{@link ConditionalScopeRegistrar} —— 作用域注册器（BeanFactoryPostProcessor）。</li>
@@ -35,7 +35,7 @@ import org.springframework.core.env.Environment;
  *     <li>{@link ConditionalRefreshListener} —— Nacos 监听器（ApplicationReadyEvent 触发）。</li>
  * </ol>
  *
- * <h3>与全局 {@code @RefreshScope} 的关系</h3>
+ * <h2>与全局 {@code @RefreshScope} 的关系</h2>
  * <p>本自动配置与 {@code NacosConfigAutoConfiguration} <strong>通过 @AutoConfigureAfter 解耦</strong>，
  * 确保在 Nacos 配置管理器注册之后才执行。两种刷新策略互不干扰。
  *
@@ -112,24 +112,24 @@ public class ConditionalRefreshAutoConfiguration {
     /**
      * 注册条件刷新监听器。
      *
-     * <p>监听 {@code ApplicationReadyEvent}，在应用就绪后为所有 (dataId, group)
-     * 注册 Nacos 配置监听器。
+     * <p>监听 {@code EnvironmentChangeEvent}（PropertySource 更新后发布），
+     * 通过反向索引精准刷新受影响的 Bean。
      *
-     * @param nacosConfigManager Nacos 配置管理器
-     * @param scope              条件刷新作用域
-     * @param postProcessor      元数据后处理器（用于获取 MetadataCollector）
-     * @param environment        Spring Environment
+     * <p>不再直连 Nacos SDK — 依赖 Spring Cloud 的事件机制保证 PropertySource-first 时序。
+     *
+     * @param scope        条件刷新作用域
+     * @param postProcessor 元数据后处理器（用于获取 MetadataCollector）
+     * @param environment  Spring Environment
      * @return 条件刷新监听器
      */
     @Bean
     @ConditionalOnMissingBean
     public ConditionalRefreshListener conditionalRefreshListener(
-            NacosConfigManager nacosConfigManager,
             ConditionalRefreshScope scope,
             RefreshOnKeysPostProcessor postProcessor,
             Environment environment) {
         log.info("Conditional refresh auto-configuration activated. " +
                 "Beans annotated with @RefreshOnKeys will be refreshed on key changes.");
-        return new ConditionalRefreshListener(nacosConfigManager, scope, postProcessor, environment);
+        return new ConditionalRefreshListener(scope, postProcessor, environment);
     }
 }

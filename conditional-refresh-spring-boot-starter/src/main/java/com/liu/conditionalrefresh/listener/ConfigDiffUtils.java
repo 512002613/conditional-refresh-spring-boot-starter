@@ -16,13 +16,17 @@ import java.util.*;
  * <p>提供将 Nacos 推送的配置文本解析为结构化 {@code Map<String, Object>}，
  * 并比较两个快照之间 <strong>值真正发生变化</strong> 的 Key 集合。
  *
- * <h3>支持的配置格式</h3>
+ * <p><strong>注意</strong>：在新架构（监听 {@code EnvironmentChangeEvent}）下，
+ * 配置变更的 diff 计算已交由 Spring Cloud 的 {@code ContextRefresher} 完成，
+ * 框架不再直接调用本类。保留此类仅为兼容性，未来版本可能移除。
+ *
+ * <h2>支持的配置格式</h2>
  * <ul>
  *     <li>Properties 格式（{@code key=value}）</li>
  *     <li>YAML 格式（支持 {@code spring.config.import: "nacos:"} 引入的 yaml 配置）</li>
  * </ul>
  *
- * <h3>Diff 语义</h3>
+ * <h2>Diff 语义</h2>
  * <ul>
  *     <li><strong>新增</strong>：旧快照中没有的 Key → 视为变更。</li>
  *     <li><strong>修改</strong>：两个快照都有但值不同 → 视为变更。</li>
